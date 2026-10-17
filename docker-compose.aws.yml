@@ -1,0 +1,24 @@
+services:
+  aws-backend:
+    image: ${DOCKERHUB_USERNAME}/interview-aws-backend:latest
+    container_name: aws-backend
+    restart: always
+    environment:
+      - RDS_WRITER_URL=${RDS_WRITER_URL}
+      - RDS_READER_URL=${RDS_READER_URL}
+      - SALAD_GATEWAY_URL=${SALAD_GATEWAY_URL}
+      - SALAD_API_SECRET=${SALAD_API_SECRET}
+    volumes:
+      - chroma_storage:/app/chroma_data
+
+  frontend:
+    image: ${DOCKERHUB_USERNAME}/interview-frontend:latest
+    container_name: frontend
+    restart: always
+    ports:
+      - "8000:80"
+    depends_on:
+      - aws-backend
+
+volumes:
+  chroma_storage:

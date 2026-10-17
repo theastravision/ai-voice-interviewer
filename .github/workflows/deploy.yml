@@ -1,0 +1,55 @@
+name: Build Images & Deploy to AWS + Salad
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Git Repo
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & Push Salad Cloud GPU Worker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./salad-gpu-worker
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/interview-salad-gpu:latest
+
+      - name: Build & Push AWS FastAPI Backend Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./aws-backend
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/interview-aws-backend:latest
+
+      - name: Build & Push Frontend UI Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/interview-frontend:latest
+
+      - name: Deploy to AWS EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            export DOCKERHUB_USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
+            export RDS_WRITER_URL="${{ secrets.RDS_WRITER_URL }}"
+            export RDS_READER_URL="${{ secrets.RDS_READER_URL }}"
+            export SALAD_GATEWAY_URL="${{ secrets.SALAD_GATEWAY_URL }}"
+            export SALAD_API_SECRET="${{ secrets.SALAD_API_SECRET }}"
+            docker pull $DOCKERHUB_USERNAME/interview-aws-backend:latest
+            docker pull $DOCKERHUB_USERNAME/interview-frontend:latest
+            docker compose -f ~/docker-compose.aws.yml up -d
