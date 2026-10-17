@@ -45,11 +45,16 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            export DOCKERHUB_USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
-            export RDS_WRITER_URL="${{ secrets.RDS_WRITER_URL }}"
-            export RDS_READER_URL="${{ secrets.RDS_READER_URL }}"
-            export SALAD_GATEWAY_URL="${{ secrets.SALAD_GATEWAY_URL }}"
-            export SALAD_API_SECRET="${{ secrets.SALAD_API_SECRET }}"
-            docker pull $DOCKERHUB_USERNAME/interview-aws-backend:latest
-            docker pull $DOCKERHUB_USERNAME/interview-frontend:latest
-            docker compose -f ~/docker-compose.aws.yml up -d
+            # .env file create karo project folder mein
+            printf 'DOCKERHUB_USERNAME=%s\n'    '${{ secrets.DOCKERHUB_USERNAME }}'  > ~/ai-voice-interview/.env
+            printf 'WRITER_DB_URL=%s\n'         '${{ secrets.RDS_WRITER_URL }}'     >> ~/ai-voice-interview/.env
+            printf 'READER_DB_URL=%s\n'         '${{ secrets.RDS_READER_URL }}'     >> ~/ai-voice-interview/.env
+            printf 'SALAD_GATEWAY_URL=%s\n'     '${{ secrets.SALAD_GATEWAY_URL }}'  >> ~/ai-voice-interview/.env
+            printf 'SALAD_API_SECRET=%s\n'      '${{ secrets.SALAD_API_SECRET }}'   >> ~/ai-voice-interview/.env
+
+            # Docker images pull karo
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/interview-aws-backend:latest
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/interview-frontend:latest
+
+            # docker-compose run karo .env file ke saath
+            docker compose -f ~/docker-compose.aws.yml --env-file ~/ai-voice-interview/.env up -d
