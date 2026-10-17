@@ -10,7 +10,7 @@ sentence-transformers==3.1.1
 pymupdf==1.24.10
 scipy==1.14.1
 numpy==1.26.4
-pyrnnoise==0.2.4
+pyrnnoise==0.4.5
 soundfile==0.12.1
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.4.1+cpu
