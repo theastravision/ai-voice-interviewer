@@ -95,14 +95,17 @@ jobs:
           script: |
             mkdir -p ~/ai-voice-interview
 
-            # .env file fresh banao
-            cat > ~/ai-voice-interview/.env << 'ENVEOF'
-            DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
-            RDS_WRITER_URL=${{ secrets.RDS_WRITER_URL }}
-            RDS_READER_URL=${{ secrets.RDS_READER_URL }}
-            SALAD_GATEWAY_URL=${{ secrets.SALAD_GATEWAY_URL }}
-            SALAD_API_SECRET=${{ secrets.SALAD_API_SECRET }}
-            ENVEOF
+            # .env file fresh create (no leading spaces)
+            echo 'DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}'  > ~/ai-voice-interview/.env
+            echo 'RDS_WRITER_URL=${{ secrets.RDS_WRITER_URL }}'        >> ~/ai-voice-interview/.env
+            echo 'RDS_READER_URL=${{ secrets.RDS_READER_URL }}'        >> ~/ai-voice-interview/.env
+            echo 'SALAD_GATEWAY_URL=${{ secrets.SALAD_GATEWAY_URL }}'  >> ~/ai-voice-interview/.env
+            echo 'SALAD_API_SECRET=${{ secrets.SALAD_API_SECRET }}'    >> ~/ai-voice-interview/.env
+            chmod 600 ~/ai-voice-interview/.env
+
+            # Verify .env contents
+            echo "✅ .env file created:"
+            cat ~/ai-voice-interview/.env
 
             # Latest images pull karo
             docker pull ${{ secrets.DOCKERHUB_USERNAME }}/interview-aws-backend:latest
@@ -112,5 +115,5 @@ jobs:
             docker compose -f ~/docker-compose.aws.yml --env-file ~/ai-voice-interview/.env down
             docker compose -f ~/docker-compose.aws.yml --env-file ~/ai-voice-interview/.env up -d
 
-            echo "✅ Containers running:"
+            echo "🚀 Containers running:"
             docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"

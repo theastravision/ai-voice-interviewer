@@ -21,7 +21,7 @@ engine_args = AsyncEngineArgs(
     model="Qwen/Qwen2.5-3B-Instruct-AWQ",
     quantization="awq",
     gpu_memory_utilization=0.55,
-    max_model_len=4096
+    max_model_len=6144
 )
 llm_engine = AsyncLLMEngine.from_engine_args(engine_args)
 
@@ -33,8 +33,35 @@ def check_auth(key: str):
 async def health():
     return {"status": "ready"}
 
+import re
+
 class QARequest(BaseModel):
     context: str
+
+def repair_json(raw: str) -> dict:
+    """Try to fix common LLM JSON issues and parse."""
+    # Remove trailing commas before } or ]
+    text = re.sub(r',\s*([}\]])', r'\1', raw)
+    # Try parsing as-is first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # If truncated, try closing open structures
+    # Count braces/brackets
+    open_braces = text.count('{') - text.count('}')
+    open_brackets = text.count('[') - text.count(']')
+    # Remove last incomplete object (after last complete })
+    last_complete = text.rfind('}')
+    if last_complete > 0:
+        truncated = text[:last_complete + 1]
+        truncated += ']' * max(0, open_brackets) + '}' * max(0, open_braces - 1)
+        truncated = re.sub(r',\s*([}\]])', r'\1', truncated)
+        try:
+            return json.loads(truncated)
+        except json.JSONDecodeError:
+            pass
+    raise ValueError(f"Could not parse LLM JSON output")
 
 @app.post("/generate-15-qa")
 async def generate_15_qa(req: QARequest, x_api_key: str = Header(...)):
@@ -46,14 +73,24 @@ Context:
 {req.context}<|im_end|>
 <|im_start|>assistant
 {{"""
-    params = SamplingParams(temperature=0.2, max_tokens=1800)
-    out = None
-    async for res in llm_engine.generate(prompt, params, uuid.uuid4().hex):
-        out = res
-    raw_text = "{" + out.outputs[0].text.strip()
-    start, end = raw_text.find("{"), raw_text.rfind("}")
-    parsed = json.loads(raw_text[start:end+1])
-    return parsed
+
+    max_retries = 2
+    last_error = None
+    for attempt in range(max_retries + 1):
+        params = SamplingParams(temperature=0.2 + (attempt * 0.1), max_tokens=3500)
+        out = None
+        async for res in llm_engine.generate(prompt, params, uuid.uuid4().hex):
+            out = res
+        raw_text = "{" + out.outputs[0].text.strip()
+        try:
+            start, end = raw_text.find("{"), raw_text.rfind("}")
+            parsed = repair_json(raw_text[start:end+1])
+            return parsed
+        except (json.JSONDecodeError, ValueError) as e:
+            last_error = str(e)
+            continue
+
+    raise HTTPException(status_code=500, detail=f"JSON parse failed after {max_retries+1} attempts: {last_error}")
 
 class TTSRequest(BaseModel):
     text: str
