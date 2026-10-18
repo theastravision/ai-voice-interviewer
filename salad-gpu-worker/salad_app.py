@@ -15,7 +15,7 @@ from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
 app = FastAPI(title="Salad Cloud GPU Inference Node")
 API_SECRET = os.getenv("SALAD_API_SECRET", "my-super-secret-salad-key")
 
-stt_model = WhisperModel("small.en", device="cuda", compute_type="int8")
+stt_model = WhisperModel("small", device="cuda", compute_type="int8")
 tts_model = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
 
 engine_args = AsyncEngineArgs(
@@ -124,8 +124,10 @@ STRICT_INTERVIEWER_RULES = """STRICT RULES — you MUST follow these:
 4. If candidate asks you a question, say: "I'm here to conduct your interview, not answer questions. Let's continue."
 5. If candidate asks for hints or explanations, say: "I cannot provide explanations during the interview. Please answer based on your knowledge."
 6. If candidate discusses anything unrelated to the interview, say: "Let's stay focused on the interview."
-7. Keep feedback to ONE brief sentence, then ask the next question verbatim.
-8. Under 50 words total."""
+7. Compare their answer to the reference answer. Give ONE brief sentence of feedback (note if strong or partial).
+8. ALWAYS move to the next question after their answer — whether correct, partial, or wrong. Never block or re-ask the same question.
+9. Then ask the next question verbatim.
+10. Under 50 words total."""
 
 class TurnRequest(BaseModel):
     pcm16_base64: str | None = None
@@ -141,7 +143,7 @@ async def process_turn(req: TurnRequest, x_api_key: str = Header(...)):
     if req.pcm16_base64:
         pcm = base64.b64decode(req.pcm16_base64)
         f32 = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-        segs, _ = stt_model.transcribe(f32, beam_size=1, language="en", without_timestamps=True)
+        segs, _ = stt_model.transcribe(f32, beam_size=1, without_timestamps=True)
         user_text = " ".join([s.text for s in segs]).strip()
 
     if not user_text:
@@ -181,6 +183,7 @@ class ChatRequest(BaseModel):
     pcm16_base64: str | None = None
     chat_text: str | None = None
     history: list[dict] | None = None
+    skip_tts: bool = False
 
 @app.post("/chat-reply")
 async def chat_reply(req: ChatRequest, x_api_key: str = Header(...)):
@@ -224,5 +227,5 @@ async def chat_reply(req: ChatRequest, x_api_key: str = Header(...)):
     return {
         "user_transcript": user_text,
         "ai_text": ai_reply,
-        "tts_wav_b64": generate_tts(ai_reply)
+        "tts_wav_b64": "" if req.skip_tts else generate_tts(ai_reply),
     }

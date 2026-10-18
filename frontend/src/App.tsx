@@ -5,6 +5,78 @@ type Message = { role: "ai" | "candidate-voice" | "candidate-chat"; text: string
 type SttStatus = "idle" | "listening" | "processing";
 type Tab = "interview" | "chat";
 
+function waitForWebSocket(ws: WebSocket, ms = 15000): Promise<void> {
+  if (ws.readyState === WebSocket.OPEN) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("Voice connection timed out")), ms);
+    ws.onopen = () => { clearTimeout(t); resolve(); };
+    ws.onerror = () => { clearTimeout(t); reject(new Error("Could not connect to voice server")); };
+  });
+}
+
+type MicBundle = {
+  stream: MediaStream;
+  audioCtx: AudioContext;
+  analyser: AnalyserNode;
+  attachPcmSender: (onPcm: (pcm: ArrayBuffer) => void) => () => void;
+};
+
+async function acquireMicrophone(sr: number): Promise<MicBundle | { error: string }> {
+  if (!window.isSecureContext) {
+    return { error: "Microphone requires HTTPS (or localhost). Open the app over a secure URL." };
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return { error: "This browser does not support microphone access." };
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    const audioCtx = new AudioContext({ sampleRate: sr });
+    await audioCtx.resume();
+    const source = audioCtx.createMediaStreamSource(stream);
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+
+    const attachPcmSender = (onPcm: (pcm: ArrayBuffer) => void) => {
+      const proc = audioCtx.createScriptProcessor(512, 1, 1);
+      proc.onaudioprocess = (e) => {
+        const ch = e.inputBuffer.getChannelData(0);
+        const pcm = new Int16Array(ch.length);
+        for (let i = 0; i < ch.length; i++) pcm[i] = Math.max(-1, Math.min(1, ch[i])) * 0x7fff;
+        onPcm(pcm.buffer);
+      };
+      source.connect(proc);
+      proc.connect(audioCtx.destination);
+      return () => {
+        proc.disconnect();
+        source.disconnect();
+      };
+    };
+
+    return { stream, audioCtx, analyser, attachPcmSender };
+  } catch (e: unknown) {
+    const name = e instanceof DOMException ? e.name : "";
+    if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+      return { error: "Microphone blocked. Click the lock icon in the address bar → allow Microphone → refresh." };
+    }
+    if (name === "NotFoundError") {
+      return { error: "No microphone detected. Plug one in or type your answers in the box below." };
+    }
+    return { error: "Could not open the microphone. Check browser permissions and try again." };
+  }
+}
+
+function pcmToAudioBuffer(audioCtx: AudioContext, pcmBytes: ArrayBuffer, sr: number): AudioBuffer {
+  const int16 = new Int16Array(pcmBytes);
+  const f32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768.0;
+  const buf = audioCtx.createBuffer(1, f32.length, sr);
+  buf.getChannelData(0).set(f32);
+  return buf;
+}
+
 /* ─── Theme ──────────────────────────────────────────────────────── */
 const T = {
   bg: "#06080f", card: "rgba(15,23,42,0.85)", glass: "rgba(30,41,59,0.55)",
@@ -94,6 +166,9 @@ function InterviewPanel() {
   const [sttStatus, setSttStatus] = useState<SttStatus>("idle");
   const [audioLevel, setAudioLevel] = useState(0);
   const [aiSpeaking, setAiSpeaking] = useState(false);
+  const [micError, setMicError] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const [aiThinking, setAiThinking] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -101,6 +176,7 @@ function InterviewPanel() {
   const micActiveRef = useRef(false);
   const ttsSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const detachPcmRef = useRef<(() => void) | null>(null);
   const animRef = useRef(0);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
@@ -125,11 +201,8 @@ function InterviewPanel() {
   };
 
   const playTts = (audioCtx: AudioContext, pcmBytes: ArrayBuffer, sr: number) => {
-    const int16 = new Int16Array(pcmBytes);
-    const f32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768.0;
-    const buf = audioCtx.createBuffer(1, f32.length, sr);
-    buf.getChannelData(0).set(f32);
+    void audioCtx.resume();
+    const buf = pcmToAudioBuffer(audioCtx, pcmBytes, sr);
     const src = audioCtx.createBufferSource();
     src.buffer = buf;
     src.connect(audioCtx.destination);
@@ -142,6 +215,7 @@ function InterviewPanel() {
   const handleInit = async () => {
     if (!resumeFile || !jdText.trim()) return alert("Upload Resume PDF and enter JD!");
     setLoading(true);
+    setMicError(null);
     try {
       const form = new FormData();
       form.append("resume", resumeFile);
@@ -150,24 +224,33 @@ function InterviewPanel() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Initialization failed");
       setSessionId(data.session_id);
-    } catch (e: any) { alert(e.message); } finally { setLoading(false); }
+      await startVoice(16000, data.session_id);
+    } catch (e: unknown) {
+      alert(e instanceof Error ? e.message : "Initialization failed");
+    } finally { setLoading(false); }
   };
 
-  const startVoice = async (sr: 8000 | 16000) => {
-    if (!sessionId) return;
+  const startVoice = async (sr: 8000 | 16000, sid?: string) => {
+    const id = sid ?? sessionId;
+    if (!id || connecting) return;
+    setConnecting(true);
+    setMicError(null);
+    endInterview(false);
+
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws/interview/${sessionId}?sr=${sr}`);
+    const ws = new WebSocket(`${proto}://${location.host}/ws/interview/${id}?sr=${sr}`);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
-    const audioCtx = new AudioContext({ sampleRate: sr });
-    audioCtxRef.current = audioCtx;
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
         const m = JSON.parse(ev.data);
-        if (m.type === "ai_text") {
+        if (m.type === "error") {
+          setMicError(m.message || "Interview session error");
+        } else if (m.type === "ai_text") {
           setSttStatus("idle");
-          setMessages((p) => [...p, { role: "ai", text: m.text }]);
+          setAiThinking(false);
+          if (m.text?.trim()) setMessages((p) => [...p, { role: "ai", text: m.text }]);
           if (m.q_index) setQIndex(m.q_index);
           if (m.remaining_seconds) setRemainingSec(m.remaining_seconds);
         } else if (m.type === "user_transcript") {
@@ -175,42 +258,59 @@ function InterviewPanel() {
           setMessages((p) => [...p, { role: "candidate-voice", text: m.text }]);
         } else if (m.type === "status") {
           if (m.status === "listening") setSttStatus("listening");
-          else if (m.status === "processing") setSttStatus("processing");
+          else if (m.status === "processing") { setSttStatus("processing"); setAiThinking(true); }
+          else if (m.status === "idle") { setSttStatus("idle"); setAiThinking(false); }
           else if (m.status === "ai_done_speaking") setAiSpeaking(false);
           else if (m.status === "interrupted") { stopTtsPlayback(); setSttStatus("listening"); }
         }
-      } else if (ev.data instanceof ArrayBuffer) {
-        playTts(audioCtx, ev.data, sr);
+      } else if (ev.data instanceof ArrayBuffer && audioCtxRef.current) {
+        playTts(audioCtxRef.current, ev.data, sr);
       }
     };
-    ws.onclose = () => { setConnected(false); setMicActive(false); setSttStatus("idle"); };
+    ws.onclose = () => {
+      setConnected(false);
+      setMicActive(false);
+      setSttStatus("idle");
+      setAiThinking(false);
+      setConnecting(false);
+    };
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: sr, channelCount: 1, echoCancellation: true, noiseSuppression: true } });
-      streamRef.current = stream;
-      const source = audioCtx.createMediaStreamSource(stream);
-      const analyser = audioCtx.createAnalyser(); analyser.fftSize = 256;
-      analyserRef.current = analyser; source.connect(analyser);
-
-      const proc = audioCtx.createScriptProcessor(512, 1, 1);
-      proc.onaudioprocess = (e) => {
+      await waitForWebSocket(ws);
+      const mic = await acquireMicrophone(sr);
+      if ("error" in mic) {
+        setMicError(mic.error);
+        setConnected(true);
+        return;
+      }
+      audioCtxRef.current = mic.audioCtx;
+      streamRef.current = mic.stream;
+      analyserRef.current = mic.analyser;
+      detachPcmRef.current = mic.attachPcmSender((pcm) => {
         if (ws.readyState !== WebSocket.OPEN || !micActiveRef.current) return;
-        const ch = e.inputBuffer.getChannelData(0);
-        // Check if user is speaking while AI is speaking → interrupt
-        const rms = Math.sqrt(ch.reduce((s, v) => s + v * v, 0) / ch.length);
+        const int16 = new Int16Array(pcm);
+        let sum = 0;
+        for (let i = 0; i < int16.length; i++) {
+          const v = int16[i] / 32768;
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / int16.length);
         if (rms > 0.02 && ttsSourceRef.current) {
           stopTtsPlayback();
           ws.send(JSON.stringify({ type: "interrupt" }));
         }
-        const pcm = new Int16Array(ch.length);
-        for (let i = 0; i < ch.length; i++) pcm[i] = Math.max(-1, Math.min(1, ch[i])) * 0x7fff;
-        ws.send(pcm.buffer);
-      };
-      source.connect(proc); proc.connect(audioCtx.destination);
-      setMicActive(true); micActiveRef.current = true;
-      startMeter(analyser);
-    } catch { console.warn("Mic unavailable; Chat-only mode."); }
-    setConnected(true);
+        ws.send(pcm);
+      });
+      setMicActive(true);
+      micActiveRef.current = true;
+      startMeter(mic.analyser);
+      setConnected(true);
+    } catch (e: unknown) {
+      ws.close();
+      setMicError(e instanceof Error ? e.message : "Failed to start voice interview");
+    } finally {
+      setConnecting(false);
+    }
   };
 
   const toggleMic = () => {
@@ -221,18 +321,30 @@ function InterviewPanel() {
     if (!next) setSttStatus("idle");
   };
 
-  const endInterview = () => {
-    wsRef.current?.close();
+  const endInterview = (closeWs = true) => {
+    if (closeWs) wsRef.current?.close();
+    wsRef.current = null;
     cancelAnimationFrame(animRef.current);
+    detachPcmRef.current?.();
+    detachPcmRef.current = null;
     streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    audioCtxRef.current?.close().catch(() => {});
+    audioCtxRef.current = null;
     stopTtsPlayback();
-    setConnected(false); setMicActive(false); setSttStatus("idle");
+    setConnected(false);
+    setMicActive(false);
+    setSttStatus("idle");
+    setAiThinking(false);
   };
 
   const sendChat = () => {
-    if (!chatInput.trim() || !wsRef.current) return;
-    wsRef.current.send(JSON.stringify({ type: "chat_answer", text: chatInput }));
-    setMessages((p) => [...p, { role: "candidate-chat", text: chatInput }]);
+    const text = chatInput.trim();
+    if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    setAiThinking(true);
+    setSttStatus("processing");
+    wsRef.current.send(JSON.stringify({ type: "chat_answer", text }));
+    setMessages((p) => [...p, { role: "candidate-chat", text }]);
     setChatInput("");
   };
 
@@ -253,8 +365,11 @@ function InterviewPanel() {
           style={{ width: "100%", padding: 14, borderRadius: 12, fontSize: 13.5, background: T.glass, border: `1px solid ${T.border}`, color: T.txt, resize: "vertical", lineHeight: 1.55 }}
           value={jdText} onChange={(e) => setJdText(e.target.value)} />
         <button className="btn btn-p" onClick={handleInit} disabled={loading} style={{ marginTop: 16, width: "100%", padding: "13px 0", fontSize: 14.5 }}>
-          {loading ? "⏳ Generating 15 RAG Questions via Salad GPU..." : "🚀 Generate 15 Questions & Start"}
+          {loading ? "⏳ Generating questions & starting voice..." : "🚀 Generate 15 Questions & Start Voice Interview"}
         </button>
+        <p style={{ color: T.txt3, fontSize: 11.5, marginTop: 10, textAlign: "center" }}>
+          Your browser will ask for microphone access — allow it to speak your answers. You can also type below.
+        </p>
       </div>
     );
   }
@@ -271,23 +386,37 @@ function InterviewPanel() {
           <span className={`dot ${connected ? "on" : "off"}`} />
           <span style={{ fontSize: 11, color: T.txt2 }}>{connected ? "Live" : "Off"}</span>
           {aiSpeaking && <span className="badge" style={{ background: "rgba(59,130,246,.15)", color: T.accent }}>🔊 AI Speaking</span>}
-          {connected && <button className="btn btn-d" style={{ padding: "7px 14px" }} onClick={endInterview}>End</button>}
+          {connected && <button className="btn btn-d" style={{ padding: "7px 14px" }} onClick={() => endInterview()}>End</button>}
         </div>
       </div>
 
-      {/* Connect Buttons */}
-      {!connected && (
-        <div className="fade" style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
-          <button className="btn btn-g" style={{ flex: 1 }} onClick={() => startVoice(16000)}>🎤 16kHz Wideband Voice</button>
-          <button className="btn btn-o" style={{ flex: 1 }} onClick={() => startVoice(8000)}>📡 8kHz Low-BW</button>
+      {connecting && (
+        <div className="fade" style={{ marginBottom: 14, padding: 12, borderRadius: 12, background: "rgba(59,130,246,.1)", border: `1px solid ${T.border}`, fontSize: 13, color: T.txt2 }}>
+          Connecting voice… allow microphone when your browser prompts.
         </div>
       )}
 
-      {/* Mic Bar */}
-      {connected && <MicBar micActive={micActive} toggleMic={toggleMic} audioLevel={audioLevel} sttStatus={sttStatus} />}
+      {micError && <MicAlert message={micError} onRetry={() => startVoice(16000)} />}
 
-      {/* Messages */}
-      <ChatBox messages={messages} chatEndRef={chatEndRef} />
+      {!connected && !connecting && (
+        <div className="fade" style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
+          <button className="btn btn-g" style={{ flex: 1 }} onClick={() => startVoice(16000)}>🎤 Reconnect voice (16 kHz)</button>
+          <button className="btn btn-o" style={{ flex: 1 }} onClick={() => startVoice(8000)}>📡 Low bandwidth (8 kHz)</button>
+        </div>
+      )}
+
+      {connected && (
+        <MicBar
+          micActive={micActive}
+          toggleMic={toggleMic}
+          audioLevel={audioLevel}
+          sttStatus={sttStatus}
+          hasStream={!!streamRef.current}
+          mode="interview"
+        />
+      )}
+
+      <ChatBox messages={messages} chatEndRef={chatEndRef} thinking={aiThinking} />
 
       {/* Input */}
       <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
@@ -307,15 +436,21 @@ function ChatPanel() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [connected, setConnected] = useState(false);
+  const [connecting, setConnecting] = useState(false);
   const [micActive, setMicActive] = useState(false);
   const [sttStatus, setSttStatus] = useState<SttStatus>("idle");
   const [audioLevel, setAudioLevel] = useState(0);
+  const [micError, setMicError] = useState<string | null>(null);
+  const [aiThinking, setAiThinking] = useState(false);
+  const [aiSpeaking, setAiSpeaking] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const micActiveRef = useRef(false);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const ttsSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const detachPcmRef = useRef<(() => void) | null>(null);
   const animRef = useRef(0);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
@@ -328,58 +463,82 @@ function ChatPanel() {
     tick();
   }, []);
 
+  const stopTts = () => {
+    try { ttsSourceRef.current?.stop(); } catch { /* already stopped */ }
+    ttsSourceRef.current = null;
+    setAiSpeaking(false);
+  };
+
   const connectChat = async (sr: 16000 | 8000 = 16000) => {
+    if (connecting) return;
+    setConnecting(true);
+    setMicError(null);
+    disconnect(false);
+
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/ws/chat?sr=${sr}`);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
-    const audioCtx = new AudioContext({ sampleRate: sr });
-    audioCtxRef.current = audioCtx;
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
         const m = JSON.parse(ev.data);
         if (m.type === "ai_text") {
           setSttStatus("idle");
-          setMessages((p) => [...p, { role: "ai", text: m.text }]);
+          setAiThinking(false);
+          if (m.text?.trim()) setMessages((p) => [...p, { role: "ai", text: m.text }]);
         } else if (m.type === "user_transcript") {
           setSttStatus("idle");
           setMessages((p) => [...p, { role: "candidate-voice", text: m.text }]);
         } else if (m.type === "status") {
           if (m.status === "listening") setSttStatus("listening");
-          else if (m.status === "processing") setSttStatus("processing");
+          else if (m.status === "processing") { setSttStatus("processing"); setAiThinking(true); }
+          else if (m.status === "idle") { setSttStatus("idle"); setAiThinking(false); }
         }
-      } else if (ev.data instanceof ArrayBuffer) {
-        const int16 = new Int16Array(ev.data);
-        const f32 = new Float32Array(int16.length);
-        for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768.0;
-        const buf = audioCtx.createBuffer(1, f32.length, sr);
-        buf.getChannelData(0).set(f32);
-        const src = audioCtx.createBufferSource();
-        src.buffer = buf; src.connect(audioCtx.destination); src.start();
+      } else if (ev.data instanceof ArrayBuffer && audioCtxRef.current) {
+        void audioCtxRef.current.resume();
+        const buf = pcmToAudioBuffer(audioCtxRef.current, ev.data, sr);
+        const src = audioCtxRef.current.createBufferSource();
+        src.buffer = buf;
+        src.connect(audioCtxRef.current.destination);
+        ttsSourceRef.current = src;
+        setAiSpeaking(true);
+        src.onended = () => { ttsSourceRef.current = null; setAiSpeaking(false); };
+        src.start();
       }
     };
-    ws.onclose = () => { setConnected(false); setMicActive(false); };
+    ws.onclose = () => {
+      setConnected(false);
+      setMicActive(false);
+      setAiThinking(false);
+      setConnecting(false);
+    };
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: sr, channelCount: 1, echoCancellation: true, noiseSuppression: true } });
-      streamRef.current = stream;
-      const source = audioCtx.createMediaStreamSource(stream);
-      const analyser = audioCtx.createAnalyser(); analyser.fftSize = 256;
-      analyserRef.current = analyser; source.connect(analyser);
-      const proc = audioCtx.createScriptProcessor(512, 1, 1);
-      proc.onaudioprocess = (e) => {
+      await waitForWebSocket(ws);
+      const mic = await acquireMicrophone(sr);
+      if ("error" in mic) {
+        setMicError(mic.error);
+        setConnected(true);
+        return;
+      }
+      audioCtxRef.current = mic.audioCtx;
+      streamRef.current = mic.stream;
+      analyserRef.current = mic.analyser;
+      detachPcmRef.current = mic.attachPcmSender((pcm) => {
         if (ws.readyState !== WebSocket.OPEN || !micActiveRef.current) return;
-        const ch = e.inputBuffer.getChannelData(0);
-        const pcm = new Int16Array(ch.length);
-        for (let i = 0; i < ch.length; i++) pcm[i] = Math.max(-1, Math.min(1, ch[i])) * 0x7fff;
-        ws.send(pcm.buffer);
-      };
-      source.connect(proc); proc.connect(audioCtx.destination);
-      setMicActive(true); micActiveRef.current = true;
-      startMeter(analyser);
-    } catch { console.warn("Mic unavailable; text-only mode."); }
-    setConnected(true);
+        ws.send(pcm);
+      });
+      setMicActive(true);
+      micActiveRef.current = true;
+      startMeter(mic.analyser);
+      setConnected(true);
+    } catch (e: unknown) {
+      ws.close();
+      setMicError(e instanceof Error ? e.message : "Could not start voice chat");
+    } finally {
+      setConnecting(false);
+    }
   };
 
   const toggleMic = () => {
@@ -391,16 +550,29 @@ function ChatPanel() {
   };
 
   const sendChat = () => {
-    if (!chatInput.trim() || !wsRef.current) return;
-    wsRef.current.send(JSON.stringify({ type: "chat_message", text: chatInput }));
-    setMessages((p) => [...p, { role: "candidate-chat", text: chatInput }]);
+    const text = chatInput.trim();
+    if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    setAiThinking(true);
+    setSttStatus("processing");
+    wsRef.current.send(JSON.stringify({ type: "chat_message", text }));
+    setMessages((p) => [...p, { role: "candidate-chat", text }]);
     setChatInput("");
   };
 
-  const disconnect = () => {
-    wsRef.current?.close(); cancelAnimationFrame(animRef.current);
+  const disconnect = (closeWs = true) => {
+    if (closeWs) wsRef.current?.close();
+    wsRef.current = null;
+    cancelAnimationFrame(animRef.current);
+    detachPcmRef.current?.();
+    detachPcmRef.current = null;
+    stopTts();
     streamRef.current?.getTracks().forEach((t) => t.stop());
-    setConnected(false); setMicActive(false);
+    streamRef.current = null;
+    audioCtxRef.current?.close().catch(() => {});
+    audioCtxRef.current = null;
+    setConnected(false);
+    setMicActive(false);
+    setAiThinking(false);
   };
 
   return (
@@ -408,24 +580,47 @@ function ChatPanel() {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
         <div>
           <h2 style={{ fontSize: 17, fontWeight: 600 }}>💬 Free Conversation</h2>
-          <p style={{ color: T.txt3, fontSize: 12, marginTop: 2 }}>Talk in English, Hindi, Marathi, Gujarati — any language!</p>
+          <p style={{ color: T.txt3, fontSize: 12, marginTop: 2 }}>Speech-to-speech in English, Hindi, Marathi, Gujarati — or type anytime.</p>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span className={`dot ${connected ? "on" : "off"}`} />
-          {connected && <button className="btn btn-d" style={{ padding: "7px 14px" }} onClick={disconnect}>Disconnect</button>}
+          {aiSpeaking && <span className="badge" style={{ background: "rgba(59,130,246,.15)", color: T.accent }}>🔊 AI speaking</span>}
+          {connected && <button className="btn btn-d" style={{ padding: "7px 14px" }} onClick={() => disconnect()}>Disconnect</button>}
         </div>
       </div>
 
-      {!connected && (
-        <div className="fade" style={{ display: "flex", gap: 10, marginBottom: 16 }}>
-          <button className="btn btn-g" style={{ flex: 1 }} onClick={() => connectChat(16000)}>🎤 Connect Voice + Chat</button>
-          <button className="btn btn-o" style={{ flex: 1 }} onClick={() => connectChat(8000)}>📡 Low-Bandwidth</button>
+      {!connected && !connecting && (
+        <div className="fade" style={{ marginBottom: 16 }}>
+          <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+            <button className="btn btn-g" style={{ flex: 1 }} onClick={() => connectChat(16000)}>🎤 Start speech conversation</button>
+            <button className="btn btn-o" style={{ flex: 1 }} onClick={() => connectChat(8000)}>📡 Low bandwidth</button>
+          </div>
+          <p style={{ color: T.txt3, fontSize: 11.5, textAlign: "center" }}>
+            Click start — your browser will ask for mic access. Speak naturally; pause when you finish a sentence.
+          </p>
         </div>
       )}
 
-      {connected && <MicBar micActive={micActive} toggleMic={toggleMic} audioLevel={audioLevel} sttStatus={sttStatus} />}
+      {connecting && (
+        <div className="fade" style={{ marginBottom: 14, padding: 12, borderRadius: 12, background: "rgba(59,130,246,.1)", border: `1px solid ${T.border}`, fontSize: 13, color: T.txt2 }}>
+          Connecting… allow microphone access to talk hands-free.
+        </div>
+      )}
 
-      <ChatBox messages={messages} chatEndRef={chatEndRef} />
+      {micError && <MicAlert message={micError} onRetry={() => connectChat(16000)} />}
+
+      {connected && (
+        <MicBar
+          micActive={micActive}
+          toggleMic={toggleMic}
+          audioLevel={audioLevel}
+          sttStatus={sttStatus}
+          hasStream={!!streamRef.current}
+          mode="chat"
+        />
+      )}
+
+      <ChatBox messages={messages} chatEndRef={chatEndRef} thinking={aiThinking} />
 
       <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
         <input className="inp" placeholder="Type in any language..." value={chatInput}
@@ -449,18 +644,48 @@ function Stat({ label, value, color }: { label: string; value: string; color: st
   );
 }
 
-function MicBar({ micActive, toggleMic, audioLevel, sttStatus }: { micActive: boolean; toggleMic: () => void; audioLevel: number; sttStatus: SttStatus }) {
+function MicAlert({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <div className="fade" style={{ marginBottom: 14, padding: 14, borderRadius: 12, background: "rgba(239,68,68,.08)", border: "1px solid rgba(239,68,68,.35)" }}>
+      <div style={{ fontSize: 13, color: T.txt, marginBottom: 8 }}>🎙️ {message}</div>
+      <button type="button" className="btn btn-p" style={{ padding: "8px 16px", fontSize: 12 }} onClick={onRetry}>
+        Try microphone again
+      </button>
+    </div>
+  );
+}
+
+function MicBar({
+  micActive, toggleMic, audioLevel, sttStatus, hasStream, mode,
+}: {
+  micActive: boolean;
+  toggleMic: () => void;
+  audioLevel: number;
+  sttStatus: SttStatus;
+  hasStream: boolean;
+  mode: "interview" | "chat";
+}) {
+  if (!hasStream) {
+    return (
+      <div className="fade" style={{ marginBottom: 16, padding: 14, borderRadius: 14, background: T.glass, border: `1px solid ${T.border}`, fontSize: 12.5, color: T.txt2, textAlign: "center" }}>
+        Voice is connected in text-only mode — use the box below, or retry the microphone banner above.
+      </div>
+    );
+  }
+
+  const hint = mode === "interview"
+    ? (micActive ? "Speak your answer — tap to mute" : "Mic muted — tap to speak")
+    : (micActive ? "Speak naturally — tap to mute" : "Mic muted — tap to talk");
+
   return (
     <div className="fade" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 20, marginBottom: 16, padding: "14px 20px", borderRadius: 14, background: T.glass, border: `1px solid ${T.border}` }}>
-      {/* Audio Bars */}
       <div className="bars" style={{ opacity: micActive ? 1 : 0.2 }}>
         {[0, 1, 2, 3, 4].map((i) => (
           <span key={i} style={{ "--bh": `${Math.max(4, audioLevel * 28 * (0.5 + Math.random() * 0.5))}px`, animationDelay: `${i * 0.12}s` } as React.CSSProperties} />
         ))}
       </div>
 
-      {/* Mic Button */}
-      <button className={`mic-btn ${micActive ? "on" : ""}`} onClick={toggleMic}
+      <button type="button" className={`mic-btn ${micActive ? "on" : ""}`} onClick={toggleMic} aria-label={micActive ? "Mute microphone" : "Unmute microphone"}
         style={{
           width: 56, height: 56, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center",
           background: micActive ? "linear-gradient(135deg,#ef4444,#dc2626)" : "linear-gradient(135deg,#22c55e,#16a34a)",
@@ -470,27 +695,34 @@ function MicBar({ micActive, toggleMic, audioLevel, sttStatus }: { micActive: bo
         <span className="r" /><span className="d" style={{ fontSize: 24 }}>{micActive ? "🎤" : "🔇"}</span>
       </button>
 
-      {/* Status */}
-      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4, maxWidth: 220 }}>
         {sttStatus !== "idle" && (
           <div className="badge fade" style={{
             background: sttStatus === "listening" ? "rgba(34,197,94,.12)" : "rgba(59,130,246,.12)",
             color: sttStatus === "listening" ? T.green : T.accent,
           }}>
-            {sttStatus === "listening" ? "🎤 Listening..." : "⏳ Processing..."}
+            {sttStatus === "listening" ? "🎤 Listening…" : "⏳ Thinking…"}
           </div>
         )}
-        <span style={{ color: T.txt3, fontSize: 10.5 }}>{micActive ? "Tap to mute" : "Tap to unmute"}</span>
+        <span style={{ color: T.txt2, fontSize: 11 }}>{hint}</span>
       </div>
     </div>
   );
 }
 
-function ChatBox({ messages, chatEndRef }: { messages: Message[]; chatEndRef: React.RefObject<HTMLDivElement> }) {
+function ChatBox({ messages, chatEndRef, thinking }: { messages: Message[]; chatEndRef: React.RefObject<HTMLDivElement>; thinking?: boolean }) {
   return (
     <div className="scroll" style={{ height: 360, overflowY: "auto", borderRadius: 14, padding: 14, background: "rgba(2,6,18,.55)", border: `1px solid ${T.border}` }}>
       {messages.length === 0 && (
         <div style={{ textAlign: "center", color: T.txt3, marginTop: 120, fontSize: 13 }}>Messages will appear here...</div>
+      )}
+      {thinking && (
+        <div className="fade" style={{ display: "flex", justifyContent: "flex-start", marginBottom: 12 }}>
+          <div className="bubble" style={{ background: "rgba(59,130,246,.1)", borderColor: "rgba(59,130,246,.18)" }}>
+            <div style={{ fontSize: 10.5, fontWeight: 600, marginBottom: 5, color: T.cyan }}>🤖 AI</div>
+            <div style={{ color: T.txt2 }}>Thinking…</div>
+          </div>
+        </div>
       )}
       {messages.map((m, i) => {
         const isAI = m.role === "ai";

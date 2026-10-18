@@ -190,6 +190,7 @@ async def interview_ws(websocket: WebSocket, session_id: str, sr: int = 16000):
                         clean_pcm16_b64 = base64.b64encode(clean_bytes).decode("utf-8")
 
             if candidate_chat or clean_pcm16_b64:
+                await websocket.send_json({"type": "status", "status": "processing"})
                 cur_q = questions[current_idx]
                 next_q = questions[current_idx + 1] if (current_idx + 1) < len(questions) else None
 
@@ -205,6 +206,13 @@ async def interview_ws(websocket: WebSocket, session_id: str, sr: int = 16000):
                     json=salad_payload,
                     headers={"x-api-key": SALAD_API_SECRET}
                 )
+                if turn_resp.status_code != 200:
+                    await websocket.send_json({
+                        "type": "ai_text",
+                        "text": "Sorry — I couldn't process that answer. Please try again.",
+                    })
+                    await websocket.send_json({"type": "status", "status": "idle"})
+                    continue
                 turn_data = turn_resp.json()
                 user_text = turn_data.get("user_transcript", "")
                 ai_reply = turn_data.get("ai_text", "")
@@ -244,6 +252,8 @@ async def interview_ws(websocket: WebSocket, session_id: str, sr: int = 16000):
                     await websocket.send_bytes(pcm_out)
                     await websocket.send_json({"type": "status", "status": "ai_done_speaking"})
                     ai_speaking = False
+
+                await websocket.send_json({"type": "status", "status": "idle"})
 
                 if is_done:
                     break
@@ -317,15 +327,25 @@ async def chat_ws(websocket: WebSocket, sr: int = 16000):
                         clean_pcm16_b64 = base64.b64encode(clean_bytes).decode("utf-8")
 
             if user_text_input or clean_pcm16_b64:
+                await websocket.send_json({"type": "status", "status": "processing"})
+                text_only = bool(user_text_input and not clean_pcm16_b64)
                 chat_resp = await http_client.post(
                     f"{SALAD_GATEWAY_URL}/chat-reply",
                     json={
                         "pcm16_base64": clean_pcm16_b64,
                         "chat_text": user_text_input,
-                        "history": chat_history[-6:]
+                        "history": chat_history[-6:],
+                        "skip_tts": text_only,
                     },
                     headers={"x-api-key": SALAD_API_SECRET}
                 )
+                if chat_resp.status_code != 200:
+                    await websocket.send_json({
+                        "type": "ai_text",
+                        "text": "Sorry — I'm having trouble right now. Please try again in a moment.",
+                    })
+                    await websocket.send_json({"type": "status", "status": "idle"})
+                    continue
                 resp_data = chat_resp.json()
                 user_text = resp_data.get("user_transcript", "")
                 ai_reply = resp_data.get("ai_text", "")
@@ -342,7 +362,15 @@ async def chat_ws(websocket: WebSocket, sr: int = 16000):
                 chat_history.append({"role": "user", "text": final_user})
                 chat_history.append({"role": "assistant", "text": ai_reply})
 
-                await websocket.send_json({"type": "ai_text", "text": ai_reply})
+                if ai_reply.strip():
+                    await websocket.send_json({"type": "ai_text", "text": ai_reply})
+                else:
+                    await websocket.send_json({
+                        "type": "ai_text",
+                        "text": "I didn't catch a full reply — could you say that again?",
+                    })
+
+                await websocket.send_json({"type": "status", "status": "idle"})
 
                 if tts_b64:
                     wav_bytes = base64.b64decode(tts_b64)
