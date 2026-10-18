@@ -3,6 +3,8 @@ services:
     image: ${DOCKERHUB_USERNAME}/interview-aws-backend:latest
     container_name: aws-backend
     restart: always
+    ports:
+      - "8000:8000"
     environment:
       - RDS_WRITER_URL=${RDS_WRITER_URL}
       - RDS_READER_URL=${RDS_READER_URL}
