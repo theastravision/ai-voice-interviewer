@@ -40,6 +40,7 @@ async def startup_event():
 async def health_check():
     return {"status": "healthy", "service": "aws-fastapi-orchestrator"}
 
+# ─── Initialize Interview ────────────────────────────────────────────
 @app.post("/api/initialize-interview")
 async def initialize_interview(
     resume: UploadFile = File(...),
@@ -91,6 +92,7 @@ async def get_interview_from_read_replica(
         "database_source": "AWS_RDS_READ_REPLICA"
     }
 
+# ─── Interview WebSocket (with interruption + strict rules) ──────────
 @app.websocket("/ws/interview/{session_id}")
 async def interview_ws(websocket: WebSocket, session_id: str, sr: int = 16000):
     await websocket.accept()
@@ -110,6 +112,7 @@ async def interview_ws(websocket: WebSocket, session_id: str, sr: int = 16000):
 
     dsp = AudioDSPPipeline()
     start_ts = time.time()
+    ai_speaking = False  # Track if TTS is being sent (for interruption)
 
     q1_text = f"Welcome! You have 30 minutes for 15 questions. Question 1: {questions[0]['question']}"
     await websocket.send_json({"type": "ai_text", "text": q1_text, "q_index": 1, "remaining_seconds": INTERVIEW_DURATION_SEC})
@@ -122,7 +125,10 @@ async def interview_ws(websocket: WebSocket, session_id: str, sr: int = 16000):
     if tts_resp.status_code == 200:
         wav_bytes = base64.b64decode(tts_resp.json()["tts_wav_b64"])
         pcm_out = await asyncio.to_thread(dsp.process_salad_tts_wav, wav_bytes, sr)
+        ai_speaking = True
         await websocket.send_bytes(pcm_out)
+        await websocket.send_json({"type": "status", "status": "ai_done_speaking"})
+        ai_speaking = False
 
     audio_buffer = bytearray()
     is_speaking = False
@@ -144,6 +150,12 @@ async def interview_ws(websocket: WebSocket, session_id: str, sr: int = 16000):
                 data = json.loads(msg["text"])
                 if data.get("type") == "chat_answer":
                     candidate_chat = data.get("text", "").strip()
+                elif data.get("type") == "interrupt":
+                    # User interrupted AI speech — acknowledge and reset
+                    ai_speaking = False
+                    audio_buffer.clear()
+                    await websocket.send_json({"type": "status", "status": "interrupted"})
+                    continue
 
             elif "bytes" in msg and msg["bytes"]:
                 chunk = msg["bytes"]
@@ -156,8 +168,15 @@ async def interview_ws(websocket: WebSocket, session_id: str, sr: int = 16000):
                     if prob > 0.55:
                         is_speaking = True
                         silence_frames = 0
+                        # If AI is speaking and user starts talking → interrupt
+                        if ai_speaking:
+                            ai_speaking = False
+                            await websocket.send_json({"type": "status", "status": "interrupted"})
                     elif is_speaking:
                         silence_frames += 1
+
+                if is_speaking and silence_frames < SILENCE_LIMIT:
+                    await websocket.send_json({"type": "status", "status": "listening"})
 
                 if is_speaking and silence_frames >= SILENCE_LIMIT:
                     raw_audio = bytes(audio_buffer)
@@ -166,6 +185,7 @@ async def interview_ws(websocket: WebSocket, session_id: str, sr: int = 16000):
                     silence_frames = 0
 
                     if len(raw_audio) > (sr * 0.4):
+                        await websocket.send_json({"type": "status", "status": "processing"})
                         clean_bytes = await asyncio.to_thread(dsp.clean_mic_to_16k_pcm_bytes, raw_audio, sr)
                         clean_pcm16_b64 = base64.b64encode(clean_bytes).decode("utf-8")
 
@@ -193,6 +213,7 @@ async def interview_ws(websocket: WebSocket, session_id: str, sr: int = 16000):
                 if not user_text:
                     continue
 
+                # Send finalized transcript to frontend
                 if clean_pcm16_b64:
                     await websocket.send_json({"type": "user_transcript", "text": user_text})
 
@@ -219,9 +240,114 @@ async def interview_ws(websocket: WebSocket, session_id: str, sr: int = 16000):
                 if tts_b64:
                     wav_bytes = base64.b64decode(tts_b64)
                     pcm_out = await asyncio.to_thread(dsp.process_salad_tts_wav, wav_bytes, sr)
+                    ai_speaking = True
                     await websocket.send_bytes(pcm_out)
+                    await websocket.send_json({"type": "status", "status": "ai_done_speaking"})
+                    ai_speaking = False
 
                 if is_done:
                     break
+    except WebSocketDisconnect:
+        pass
+
+# ─── Free Chat WebSocket (multilingual, any topic) ───────────────────
+@app.websocket("/ws/chat")
+async def chat_ws(websocket: WebSocket, sr: int = 16000):
+    await websocket.accept()
+    dsp = AudioDSPPipeline()
+    chat_history: list[dict] = []
+
+    audio_buffer = bytearray()
+    is_speaking = False
+    silence_frames = 0
+    SILENCE_LIMIT = 22
+
+    # Welcome message
+    await websocket.send_json({
+        "type": "ai_text",
+        "text": "Hey! I'm your AI buddy. You can talk to me in English, Hindi, Marathi, Gujarati — any language! What's on your mind? 😊"
+    })
+    tts_resp = await http_client.post(
+        f"{SALAD_GATEWAY_URL}/tts-only",
+        json={"text": "Hey! I'm your AI buddy. You can talk to me in any language. What's on your mind?"},
+        headers={"x-api-key": SALAD_API_SECRET}
+    )
+    if tts_resp.status_code == 200:
+        wav_bytes = base64.b64decode(tts_resp.json()["tts_wav_b64"])
+        pcm_out = await asyncio.to_thread(dsp.process_salad_tts_wav, wav_bytes, sr)
+        await websocket.send_bytes(pcm_out)
+
+    try:
+        while True:
+            msg = await websocket.receive()
+            user_text_input = None
+            clean_pcm16_b64 = None
+
+            if "text" in msg and msg["text"]:
+                data = json.loads(msg["text"])
+                if data.get("type") == "chat_message":
+                    user_text_input = data.get("text", "").strip()
+
+            elif "bytes" in msg and msg["bytes"]:
+                chunk = msg["bytes"]
+                audio_buffer.extend(chunk)
+                pcm_float = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                pcm_16k = np.repeat(pcm_float, 2) if sr == 8000 else pcm_float
+
+                if len(pcm_16k) >= 512:
+                    prob = vad_model(torch.from_numpy(pcm_16k[:512]), 16000).item()
+                    if prob > 0.55:
+                        is_speaking = True
+                        silence_frames = 0
+                    elif is_speaking:
+                        silence_frames += 1
+
+                if is_speaking and silence_frames < SILENCE_LIMIT:
+                    await websocket.send_json({"type": "status", "status": "listening"})
+
+                if is_speaking and silence_frames >= SILENCE_LIMIT:
+                    raw_audio = bytes(audio_buffer)
+                    audio_buffer.clear()
+                    is_speaking = False
+                    silence_frames = 0
+
+                    if len(raw_audio) > (sr * 0.4):
+                        await websocket.send_json({"type": "status", "status": "processing"})
+                        clean_bytes = await asyncio.to_thread(dsp.clean_mic_to_16k_pcm_bytes, raw_audio, sr)
+                        clean_pcm16_b64 = base64.b64encode(clean_bytes).decode("utf-8")
+
+            if user_text_input or clean_pcm16_b64:
+                chat_resp = await http_client.post(
+                    f"{SALAD_GATEWAY_URL}/chat-reply",
+                    json={
+                        "pcm16_base64": clean_pcm16_b64,
+                        "chat_text": user_text_input,
+                        "history": chat_history[-6:]
+                    },
+                    headers={"x-api-key": SALAD_API_SECRET}
+                )
+                resp_data = chat_resp.json()
+                user_text = resp_data.get("user_transcript", "")
+                ai_reply = resp_data.get("ai_text", "")
+                tts_b64 = resp_data.get("tts_wav_b64", "")
+
+                if not (user_text or user_text_input):
+                    continue
+
+                final_user = user_text or user_text_input
+
+                if clean_pcm16_b64 and user_text:
+                    await websocket.send_json({"type": "user_transcript", "text": user_text})
+
+                chat_history.append({"role": "user", "text": final_user})
+                chat_history.append({"role": "assistant", "text": ai_reply})
+
+                await websocket.send_json({"type": "ai_text", "text": ai_reply})
+
+                if tts_b64:
+                    wav_bytes = base64.b64decode(tts_b64)
+                    pcm_out = await asyncio.to_thread(dsp.process_salad_tts_wav, wav_bytes, sr)
+                    await websocket.send_bytes(pcm_out)
+
     except WebSocketDisconnect:
         pass

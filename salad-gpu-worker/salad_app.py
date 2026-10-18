@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import re
 import uuid
 import base64
 import numpy as np
@@ -25,33 +26,46 @@ engine_args = AsyncEngineArgs(
 )
 llm_engine = AsyncLLMEngine.from_engine_args(engine_args)
 
+# ─── Indian English TTS Config ──────────────────────────────────────
+TTS_VOICE = "hm_psi"        # Indian Male — bright, crisp, energetic
+TTS_LANG  = "en-gb"          # British phonemizer (closest to Indian English)
+
 def check_auth(key: str):
     if key != API_SECRET:
         raise HTTPException(status_code=401, detail="Invalid API Key")
+
+def detect_lang_for_tts(text: str) -> str:
+    """Detect if text has Indic script → use 'hi', else 'en-gb'."""
+    indic_pattern = re.compile(r'[\u0900-\u097F\u0A80-\u0AFF\u0900-\u097F]')
+    if indic_pattern.search(text):
+        return "hi"
+    return TTS_LANG
+
+def generate_tts(text: str) -> str:
+    """Generate TTS audio and return base64 WAV."""
+    lang = detect_lang_for_tts(text)
+    samples, sr = tts_model.create(text, voice=TTS_VOICE, speed=1.05, lang=lang)
+    buf = io.BytesIO()
+    sf.write(buf, samples, sr, format="WAV", subtype="PCM_16")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 @app.get("/health")
 async def health():
     return {"status": "ready"}
 
-import re
-
+# ─── Common JSON repair ─────────────────────────────────────────────
 class QARequest(BaseModel):
     context: str
 
 def repair_json(raw: str) -> dict:
     """Try to fix common LLM JSON issues and parse."""
-    # Remove trailing commas before } or ]
     text = re.sub(r',\s*([}\]])', r'\1', raw)
-    # Try parsing as-is first
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # If truncated, try closing open structures
-    # Count braces/brackets
     open_braces = text.count('{') - text.count('}')
     open_brackets = text.count('[') - text.count(']')
-    # Remove last incomplete object (after last complete })
     last_complete = text.rfind('}')
     if last_complete > 0:
         truncated = text[:last_complete + 1]
@@ -61,8 +75,9 @@ def repair_json(raw: str) -> dict:
             return json.loads(truncated)
         except json.JSONDecodeError:
             pass
-    raise ValueError(f"Could not parse LLM JSON output")
+    raise ValueError("Could not parse LLM JSON output")
 
+# ─── Generate 15 Q&A ────────────────────────────────────────────────
 @app.post("/generate-15-qa")
 async def generate_15_qa(req: QARequest, x_api_key: str = Header(...)):
     check_auth(x_api_key)
@@ -92,16 +107,25 @@ Context:
 
     raise HTTPException(status_code=500, detail=f"JSON parse failed after {max_retries+1} attempts: {last_error}")
 
+# ─── TTS Only ────────────────────────────────────────────────────────
 class TTSRequest(BaseModel):
     text: str
 
 @app.post("/tts-only")
 async def tts_only(req: TTSRequest, x_api_key: str = Header(...)):
     check_auth(x_api_key)
-    samples, sr = tts_model.create(req.text, voice="af_heart", speed=1.05, lang="en-us")
-    buf = io.BytesIO()
-    sf.write(buf, samples, sr, format="WAV", subtype="PCM_16")
-    return {"tts_wav_b64": base64.b64encode(buf.getvalue()).decode("utf-8")}
+    return {"tts_wav_b64": generate_tts(req.text)}
+
+# ─── Interview Turn (STRICT mode) ───────────────────────────────────
+STRICT_INTERVIEWER_RULES = """STRICT RULES — you MUST follow these:
+1. You are ONLY an interviewer. Your ONLY job is to ask questions and give brief feedback.
+2. NEVER answer any technical question from the candidate.
+3. NEVER explain any concept, topic, or technology.
+4. If candidate asks you a question, say: "I'm here to conduct your interview, not answer questions. Let's continue."
+5. If candidate asks for hints or explanations, say: "I cannot provide explanations during the interview. Please answer based on your knowledge."
+6. If candidate discusses anything unrelated to the interview, say: "Let's stay focused on the interview."
+7. Keep feedback to ONE brief sentence, then ask the next question verbatim.
+8. Under 50 words total."""
 
 class TurnRequest(BaseModel):
     pcm16_base64: str | None = None
@@ -124,21 +148,81 @@ async def process_turn(req: TurnRequest, x_api_key: str = Header(...)):
         return {"user_transcript": "", "ai_text": "", "tts_wav_b64": ""}
 
     if req.next_question:
-        prompt = f"<|im_start|>system\nQuestion asked: {req.current_question}\nReference Answer: {req.reference_answer}\nCandidate answered: {user_text}\nGive 1 brief sentence of feedback, then ask verbatim: \"{req.next_question}\". Under 45 words.<|im_end|>\n<|im_start|>assistant\n"
+        prompt = (
+            f"<|im_start|>system\n{STRICT_INTERVIEWER_RULES}\n"
+            f"Question asked: {req.current_question}\n"
+            f"Reference Answer: {req.reference_answer}\n"
+            f"Candidate said: {user_text}\n"
+            f"Give 1 brief sentence of feedback, then ask verbatim: \"{req.next_question}\".\n"
+            f"<|im_end|>\n<|im_start|>assistant\n"
+        )
     else:
-        prompt = f"<|im_start|>system\nCandidate answered final question: \"{user_text}\". Thank them warmly in 2 sentences.<|im_end|>\n<|im_start|>assistant\n"
+        prompt = (
+            f"<|im_start|>system\n{STRICT_INTERVIEWER_RULES}\n"
+            f"Candidate answered the final question: \"{user_text}\". "
+            f"Thank them warmly in 2 sentences. Do not answer any questions.\n"
+            f"<|im_end|>\n<|im_start|>assistant\n"
+        )
 
-    params = SamplingParams(temperature=0.3, max_tokens=90)
+    params = SamplingParams(temperature=0.3, max_tokens=120)
     out = None
     async for res in llm_engine.generate(prompt, params, uuid.uuid4().hex):
         out = res
     ai_reply = out.outputs[0].text.strip()
 
-    samples, sr = tts_model.create(ai_reply, voice="af_heart", speed=1.05, lang="en-us")
-    buf = io.BytesIO()
-    sf.write(buf, samples, sr, format="WAV", subtype="PCM_16")
     return {
         "user_transcript": user_text,
         "ai_text": ai_reply,
-        "tts_wav_b64": base64.b64encode(buf.getvalue()).decode("utf-8")
+        "tts_wav_b64": generate_tts(ai_reply)
+    }
+
+# ─── Free Chat (multilingual conversational) ────────────────────────
+class ChatRequest(BaseModel):
+    pcm16_base64: str | None = None
+    chat_text: str | None = None
+    history: list[dict] | None = None
+
+@app.post("/chat-reply")
+async def chat_reply(req: ChatRequest, x_api_key: str = Header(...)):
+    check_auth(x_api_key)
+    user_text = req.chat_text
+    if req.pcm16_base64:
+        pcm = base64.b64decode(req.pcm16_base64)
+        f32 = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        segs, _ = stt_model.transcribe(f32, beam_size=1, without_timestamps=True)
+        user_text = " ".join([s.text for s in segs]).strip()
+
+    if not user_text:
+        return {"user_transcript": "", "ai_text": "", "tts_wav_b64": ""}
+
+    # Build conversation history
+    history_str = ""
+    if req.history:
+        for msg in req.history[-6:]:  # last 6 messages for context
+            role = "user" if msg.get("role") == "user" else "assistant"
+            history_str += f"<|im_start|>{role}\n{msg.get('text', '')}<|im_end|>\n"
+
+    prompt = (
+        "<|im_start|>system\n"
+        "You are a friendly, knowledgeable AI assistant with an Indian personality. "
+        "You can converse fluently in English, Hindi, Marathi, Gujarati, and other Indian languages. "
+        "Match the language the user speaks in. Be conversational, warm, and helpful. "
+        "You can discuss any topic freely — technology, culture, sports, philosophy, anything. "
+        "Keep responses concise (under 60 words) and natural.\n"
+        "<|im_end|>\n"
+        f"{history_str}"
+        f"<|im_start|>user\n{user_text}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+    params = SamplingParams(temperature=0.7, max_tokens=150)
+    out = None
+    async for res in llm_engine.generate(prompt, params, uuid.uuid4().hex):
+        out = res
+    ai_reply = out.outputs[0].text.strip()
+
+    return {
+        "user_transcript": user_text,
+        "ai_text": ai_reply,
+        "tts_wav_b64": generate_tts(ai_reply)
     }
