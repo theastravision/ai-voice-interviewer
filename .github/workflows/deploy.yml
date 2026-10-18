@@ -38,6 +38,15 @@ jobs:
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/interview-frontend:latest
 
+      - name: Copy docker-compose to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "docker-compose.aws.yml"
+          target: "~/"
+
       - name: Deploy to AWS EC2 via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -45,19 +54,30 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            # Ensure directory exists
+            # Project directory ensure karo
             mkdir -p ~/ai-voice-interview
 
-            # .env file create karo — names MUST match docker-compose.aws.yml substitution vars
-            printf 'DOCKERHUB_USERNAME=%s\n'  '${{ secrets.DOCKERHUB_USERNAME }}'  > ~/ai-voice-interview/.env
-            printf 'RDS_WRITER_URL=%s\n'      '${{ secrets.RDS_WRITER_URL }}'     >> ~/ai-voice-interview/.env
-            printf 'RDS_READER_URL=%s\n'      '${{ secrets.RDS_READER_URL }}'     >> ~/ai-voice-interview/.env
-            printf 'SALAD_GATEWAY_URL=%s\n'   '${{ secrets.SALAD_GATEWAY_URL }}'  >> ~/ai-voice-interview/.env
-            printf 'SALAD_API_SECRET=%s\n'    '${{ secrets.SALAD_API_SECRET }}'   >> ~/ai-voice-interview/.env
+            # .env file fresh banao (secrets se)
+            cat > ~/ai-voice-interview/.env << 'ENVEOF'
+            DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
+            RDS_WRITER_URL=${{ secrets.RDS_WRITER_URL }}
+            RDS_READER_URL=${{ secrets.RDS_READER_URL }}
+            SALAD_GATEWAY_URL=${{ secrets.SALAD_GATEWAY_URL }}
+            SALAD_API_SECRET=${{ secrets.SALAD_API_SECRET }}
+            ENVEOF
 
-            # Docker images pull karo
-            docker pull '${{ secrets.DOCKERHUB_USERNAME }}'/interview-aws-backend:latest
-            docker pull '${{ secrets.DOCKERHUB_USERNAME }}'/interview-frontend:latest
+            # Verify .env bana
+            echo "✅ .env file:"
+            cat ~/ai-voice-interview/.env
 
-            # docker-compose run karo .env file ke saath
+            # Latest images pull karo
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/interview-aws-backend:latest
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/interview-frontend:latest
+
+            # Purane containers band karo aur naye start karo
+            docker compose -f ~/docker-compose.aws.yml --env-file ~/ai-voice-interview/.env down
             docker compose -f ~/docker-compose.aws.yml --env-file ~/ai-voice-interview/.env up -d
+
+            # Status check
+            echo "🚀 Running containers:"
+            docker ps
