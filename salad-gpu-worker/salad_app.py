@@ -26,28 +26,47 @@ engine_args = AsyncEngineArgs(
 )
 llm_engine = AsyncLLMEngine.from_engine_args(engine_args)
 
-# ─── Indian English TTS Config ──────────────────────────────────────
-TTS_VOICE = "hm_psi"        # Indian Male — bright, crisp, energetic
-TTS_LANG  = "en-gb"          # British phonemizer (closest to Indian English)
+# speech_lang from frontend → Whisper + Kokoro settings
+SPEECH_LANG_CONFIG: dict[str, dict[str, str]] = {
+    "en-in": {"whisper": "en", "tts_lang": "en-gb", "tts_voice": "hm_psi", "llm_hint": "Indian English"},
+    "hi": {"whisper": "hi", "tts_lang": "hi", "tts_voice": "hm_psi", "llm_hint": "Hindi (Devanagari)"},
+    "mr": {"whisper": "mr", "tts_lang": "hi", "tts_voice": "hm_psi", "llm_hint": "Marathi (Devanagari)"},
+    "gu": {"whisper": "gu", "tts_lang": "hi", "tts_voice": "hm_psi", "llm_hint": "Gujarati (Gujarati script)"},
+}
+DEFAULT_SPEECH_LANG = "en-in"
+
+def normalize_speech_lang(lang: str | None) -> str:
+    if lang and lang in SPEECH_LANG_CONFIG:
+        return lang
+    return DEFAULT_SPEECH_LANG
 
 def check_auth(key: str):
     if key != API_SECRET:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
-def detect_lang_for_tts(text: str) -> str:
-    """Detect if text has Indic script → use 'hi', else 'en-gb'."""
-    indic_pattern = re.compile(r'[\u0900-\u097F\u0A80-\u0AFF\u0900-\u097F]')
-    if indic_pattern.search(text):
-        return "hi"
-    return TTS_LANG
+def transcribe_audio(f32: np.ndarray, speech_lang: str) -> str:
+    cfg = SPEECH_LANG_CONFIG[normalize_speech_lang(speech_lang)]
+    segs, _ = stt_model.transcribe(
+        f32,
+        beam_size=1,
+        without_timestamps=True,
+        language=cfg["whisper"],
+    )
+    return " ".join([s.text for s in segs]).strip()
 
-def generate_tts(text: str) -> str:
+def generate_tts(text: str, speech_lang: str | None = None) -> str:
     """Generate TTS audio and return base64 WAV."""
-    lang = detect_lang_for_tts(text)
-    samples, sr = tts_model.create(text, voice=TTS_VOICE, speed=1.05, lang=lang)
+    cfg = SPEECH_LANG_CONFIG[normalize_speech_lang(speech_lang)]
+    samples, sr = tts_model.create(
+        text, voice=cfg["tts_voice"], speed=1.05, lang=cfg["tts_lang"]
+    )
     buf = io.BytesIO()
     sf.write(buf, samples, sr, format="WAV", subtype="PCM_16")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+def llm_language_instruction(speech_lang: str | None) -> str:
+    cfg = SPEECH_LANG_CONFIG[normalize_speech_lang(speech_lang)]
+    return f"Always respond in {cfg['llm_hint']}."
 
 @app.get("/health")
 async def health():
@@ -110,11 +129,12 @@ Context:
 # ─── TTS Only ────────────────────────────────────────────────────────
 class TTSRequest(BaseModel):
     text: str
+    speech_lang: str | None = DEFAULT_SPEECH_LANG
 
 @app.post("/tts-only")
 async def tts_only(req: TTSRequest, x_api_key: str = Header(...)):
     check_auth(x_api_key)
-    return {"tts_wav_b64": generate_tts(req.text)}
+    return {"tts_wav_b64": generate_tts(req.text, req.speech_lang)}
 
 # ─── Interview Turn (STRICT mode) ───────────────────────────────────
 STRICT_INTERVIEWER_RULES = """STRICT RULES — you MUST follow these:
@@ -135,23 +155,25 @@ class TurnRequest(BaseModel):
     current_question: str
     reference_answer: str
     next_question: str | None = None
+    speech_lang: str | None = DEFAULT_SPEECH_LANG
 
 @app.post("/process-turn")
 async def process_turn(req: TurnRequest, x_api_key: str = Header(...)):
     check_auth(x_api_key)
+    speech_lang = normalize_speech_lang(req.speech_lang)
     user_text = req.chat_text
     if req.pcm16_base64:
         pcm = base64.b64decode(req.pcm16_base64)
         f32 = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-        segs, _ = stt_model.transcribe(f32, beam_size=1, without_timestamps=True)
-        user_text = " ".join([s.text for s in segs]).strip()
+        user_text = transcribe_audio(f32, speech_lang)
 
     if not user_text:
         return {"user_transcript": "", "ai_text": "", "tts_wav_b64": ""}
 
+    lang_rule = llm_language_instruction(speech_lang)
     if req.next_question:
         prompt = (
-            f"<|im_start|>system\n{STRICT_INTERVIEWER_RULES}\n"
+            f"<|im_start|>system\n{STRICT_INTERVIEWER_RULES}\n{lang_rule}\n"
             f"Question asked: {req.current_question}\n"
             f"Reference Answer: {req.reference_answer}\n"
             f"Candidate said: {user_text}\n"
@@ -160,7 +182,7 @@ async def process_turn(req: TurnRequest, x_api_key: str = Header(...)):
         )
     else:
         prompt = (
-            f"<|im_start|>system\n{STRICT_INTERVIEWER_RULES}\n"
+            f"<|im_start|>system\n{STRICT_INTERVIEWER_RULES}\n{lang_rule}\n"
             f"Candidate answered the final question: \"{user_text}\". "
             f"Thank them warmly in 2 sentences. Do not answer any questions.\n"
             f"<|im_end|>\n<|im_start|>assistant\n"
@@ -175,7 +197,7 @@ async def process_turn(req: TurnRequest, x_api_key: str = Header(...)):
     return {
         "user_transcript": user_text,
         "ai_text": ai_reply,
-        "tts_wav_b64": generate_tts(ai_reply)
+        "tts_wav_b64": generate_tts(ai_reply, speech_lang),
     }
 
 # ─── Free Chat (multilingual conversational) ────────────────────────
@@ -184,16 +206,17 @@ class ChatRequest(BaseModel):
     chat_text: str | None = None
     history: list[dict] | None = None
     skip_tts: bool = False
+    speech_lang: str | None = DEFAULT_SPEECH_LANG
 
 @app.post("/chat-reply")
 async def chat_reply(req: ChatRequest, x_api_key: str = Header(...)):
     check_auth(x_api_key)
+    speech_lang = normalize_speech_lang(req.speech_lang)
     user_text = req.chat_text
     if req.pcm16_base64:
         pcm = base64.b64decode(req.pcm16_base64)
         f32 = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-        segs, _ = stt_model.transcribe(f32, beam_size=1, without_timestamps=True)
-        user_text = " ".join([s.text for s in segs]).strip()
+        user_text = transcribe_audio(f32, speech_lang)
 
     if not user_text:
         return {"user_transcript": "", "ai_text": "", "tts_wav_b64": ""}
@@ -205,11 +228,11 @@ async def chat_reply(req: ChatRequest, x_api_key: str = Header(...)):
             role = "user" if msg.get("role") == "user" else "assistant"
             history_str += f"<|im_start|>{role}\n{msg.get('text', '')}<|im_end|>\n"
 
+    lang_rule = llm_language_instruction(speech_lang)
     prompt = (
         "<|im_start|>system\n"
         "You are a friendly, knowledgeable AI assistant with an Indian personality. "
-        "You can converse fluently in English, Hindi, Marathi, Gujarati, and other Indian languages. "
-        "Match the language the user speaks in. Be conversational, warm, and helpful. "
+        f"{lang_rule} Be conversational, warm, and helpful. "
         "You can discuss any topic freely — technology, culture, sports, philosophy, anything. "
         "Keep responses concise (under 60 words) and natural.\n"
         "<|im_end|>\n"
@@ -227,5 +250,5 @@ async def chat_reply(req: ChatRequest, x_api_key: str = Header(...)):
     return {
         "user_transcript": user_text,
         "ai_text": ai_reply,
-        "tts_wav_b64": "" if req.skip_tts else generate_tts(ai_reply),
+        "tts_wav_b64": "" if req.skip_tts else generate_tts(ai_reply, speech_lang),
     }

@@ -4,6 +4,14 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 type Message = { role: "ai" | "candidate-voice" | "candidate-chat"; text: string };
 type SttStatus = "idle" | "listening" | "processing";
 type Tab = "interview" | "chat";
+type SpeechLang = "en-in" | "hi" | "mr" | "gu";
+
+const SPEECH_LANG_OPTIONS: { value: SpeechLang; label: string }[] = [
+  { value: "en-in", label: "English (Indian accent)" },
+  { value: "hi", label: "Hindi" },
+  { value: "mr", label: "Marathi" },
+  { value: "gu", label: "Gujarati" },
+];
 
 function waitForWebSocket(ws: WebSocket, ms = 15000): Promise<void> {
   if (ws.readyState === WebSocket.OPEN) return Promise.resolve();
@@ -22,9 +30,6 @@ type MicBundle = {
 };
 
 async function acquireMicrophone(sr: number): Promise<MicBundle | { error: string }> {
-  if (!window.isSecureContext) {
-    return { error: "Microphone requires HTTPS (or localhost). Open the app over a secure URL." };
-  }
   if (!navigator.mediaDevices?.getUserMedia) {
     return { error: "This browser does not support microphone access." };
   }
@@ -124,6 +129,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:${T.bg};color:${T.txt}}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>("interview");
+  const [speechLang, setSpeechLang] = useState<SpeechLang>("en-in");
 
   return (
     <>
@@ -134,16 +140,23 @@ export default function App() {
           <h1 style={{ fontSize: 26, fontWeight: 700, background: "linear-gradient(135deg,#3b82f6,#22d3ee)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
             🎙️ AI Voice Technical Interviewer
           </h1>
-          <p style={{ color: T.txt3, fontSize: 13, marginTop: 4 }}>Salad Cloud GPU • Real-time STT + Indian English TTS</p>
+          <p style={{ color: T.txt3, fontSize: 13, marginTop: 4 }}>Salad Cloud GPU • Real-time STT + TTS</p>
         </div>
 
-        {/* Tabs */}
-        <div style={{ display: "flex", gap: 4, marginBottom: 0 }}>
-          <button className={`tab ${activeTab === "interview" ? "active" : "inactive"}`} onClick={() => setActiveTab("interview")}>🎤 Interview</button>
-          <button className={`tab ${activeTab === "chat" ? "active" : "inactive"}`} onClick={() => setActiveTab("chat")}>💬 Free Chat</button>
+        {/* Tabs + language */}
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "flex-end", justifyContent: "space-between", gap: 12, marginBottom: 0 }}>
+          <div style={{ display: "flex", gap: 4 }}>
+            <button className={`tab ${activeTab === "interview" ? "active" : "inactive"}`} onClick={() => setActiveTab("interview")}>🎤 Interview</button>
+            <button className={`tab ${activeTab === "chat" ? "active" : "inactive"}`} onClick={() => setActiveTab("chat")}>💬 Free Chat</button>
+          </div>
+          <LanguageSelect value={speechLang} onChange={setSpeechLang} disabled={false} />
         </div>
 
-        {activeTab === "interview" ? <InterviewPanel /> : <ChatPanel />}
+        {activeTab === "interview" ? (
+          <InterviewPanel speechLang={speechLang} />
+        ) : (
+          <ChatPanel speechLang={speechLang} />
+        )}
       </div>
     </>
   );
@@ -152,7 +165,7 @@ export default function App() {
 /* ═══════════════════════════════════════════════════════════════════
    INTERVIEW PANEL
    ═══════════════════════════════════════════════════════════════════ */
-function InterviewPanel() {
+function InterviewPanel({ speechLang }: { speechLang: SpeechLang }) {
   const [resumeFile, setResumeFile] = useState<File | null>(null);
   const [jdText, setJdText] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -179,6 +192,14 @@ function InterviewPanel() {
   const detachPcmRef = useRef<(() => void) | null>(null);
   const animRef = useRef(0);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const speechLangRef = useRef(speechLang);
+
+  useEffect(() => { speechLangRef.current = speechLang; }, [speechLang]);
+  useEffect(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "set_language", lang: speechLang }));
+    }
+  }, [speechLang]);
 
   useEffect(() => { micActiveRef.current = micActive; }, [micActive]);
   useEffect(() => {
@@ -238,7 +259,9 @@ function InterviewPanel() {
     endInterview(false);
 
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws/interview/${id}?sr=${sr}`);
+    const ws = new WebSocket(
+      `${proto}://${location.host}/ws/interview/${id}?sr=${sr}&lang=${encodeURIComponent(speechLangRef.current)}`,
+    );
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
@@ -432,7 +455,7 @@ function InterviewPanel() {
 /* ═══════════════════════════════════════════════════════════════════
    FREE CHAT PANEL
    ═══════════════════════════════════════════════════════════════════ */
-function ChatPanel() {
+function ChatPanel({ speechLang }: { speechLang: SpeechLang }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [connected, setConnected] = useState(false);
@@ -453,6 +476,14 @@ function ChatPanel() {
   const detachPcmRef = useRef<(() => void) | null>(null);
   const animRef = useRef(0);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const speechLangRef = useRef(speechLang);
+
+  useEffect(() => { speechLangRef.current = speechLang; }, [speechLang]);
+  useEffect(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "set_language", lang: speechLang }));
+    }
+  }, [speechLang]);
 
   useEffect(() => { micActiveRef.current = micActive; }, [micActive]);
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
@@ -476,7 +507,9 @@ function ChatPanel() {
     disconnect(false);
 
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws/chat?sr=${sr}`);
+    const ws = new WebSocket(
+      `${proto}://${location.host}/ws/chat?sr=${sr}&lang=${encodeURIComponent(speechLangRef.current)}`,
+    );
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
@@ -635,6 +668,41 @@ function ChatPanel() {
 /* ═══════════════════════════════════════════════════════════════════
    SHARED COMPONENTS
    ═══════════════════════════════════════════════════════════════════ */
+function LanguageSelect({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: SpeechLang;
+  onChange: (v: SpeechLang) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11, color: T.txt2 }}>
+      Speech language (STT + TTS)
+      <select
+        className="inp"
+        value={value}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.value as SpeechLang)}
+        style={{
+          padding: "8px 12px",
+          borderRadius: 10,
+          fontSize: 13,
+          background: T.glass,
+          border: `1px solid ${T.border}`,
+          color: T.txt,
+          minWidth: 200,
+        }}
+      >
+        {SPEECH_LANG_OPTIONS.map((o) => (
+          <option key={o.value} value={o.value}>{o.label}</option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 function Stat({ label, value, color }: { label: string; value: string; color: string }) {
   return (
     <div style={{ background: T.glass, padding: "6px 14px", borderRadius: 10, border: `1px solid ${T.border}` }}>
