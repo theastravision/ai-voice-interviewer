@@ -102,7 +102,7 @@ function InterviewPanel() {
   const ttsSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animRef = useRef(0);
-  const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => { micActiveRef.current = micActive; }, [micActive]);
   useEffect(() => {
@@ -317,7 +317,7 @@ function ChatPanel() {
   const micActiveRef = useRef(false);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animRef = useRef(0);
-  const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => { micActiveRef.current = micActive; }, [micActive]);
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
@@ -486,7 +486,7 @@ function MicBar({ micActive, toggleMic, audioLevel, sttStatus }: { micActive: bo
   );
 }
 
-function ChatBox({ messages, chatEndRef }: { messages: Message[]; chatEndRef: React.RefObject<HTMLDivElement | null> }) {
+function ChatBox({ messages, chatEndRef }: { messages: Message[]; chatEndRef: React.RefObject<HTMLDivElement> }) {
   return (
     <div className="scroll" style={{ height: 360, overflowY: "auto", borderRadius: 14, padding: 14, background: "rgba(2,6,18,.55)", border: `1px solid ${T.border}` }}>
       {messages.length === 0 && (
