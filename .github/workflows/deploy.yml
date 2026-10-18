@@ -5,8 +5,30 @@ on:
     branches: [ "main" ]
 
 jobs:
+  # ─── Step 1: Detect which folders changed ───────────────────────────────────
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      salad:    ${{ steps.filter.outputs.salad }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'aws-backend/**'
+            frontend:
+              - 'frontend/**'
+            salad:
+              - 'salad-gpu-worker/**'
+
+  # ─── Step 2: Build only changed images ──────────────────────────────────────
   build-and-push:
     runs-on: ubuntu-latest
+    needs: changes
     steps:
       - name: Checkout Git Repo
         uses: actions/checkout@v4
@@ -17,27 +39,43 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build & Push Salad Cloud GPU Worker Image
+      - name: Set up Docker Buildx (for caching)
+        uses: docker/setup-buildx-action@v3
+
+      # ── Salad GPU Worker (only if salad-gpu-worker/ changed) ──
+      - name: Build & Push Salad GPU Worker Image
+        if: needs.changes.outputs.salad == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ./salad-gpu-worker
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/interview-salad-gpu:latest
+          cache-from: type=gha,scope=salad
+          cache-to:   type=gha,scope=salad,mode=max
 
+      # ── FastAPI Backend (only if aws-backend/ changed) ──
       - name: Build & Push AWS FastAPI Backend Image
+        if: needs.changes.outputs.backend == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ./aws-backend
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/interview-aws-backend:latest
+          cache-from: type=gha,scope=backend
+          cache-to:   type=gha,scope=backend,mode=max
 
+      # ── Frontend (only if frontend/ changed) ──
       - name: Build & Push Frontend UI Image
+        if: needs.changes.outputs.frontend == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ./frontend
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/interview-frontend:latest
+          cache-from: type=gha,scope=frontend
+          cache-to:   type=gha,scope=frontend,mode=max
 
+      # ─── Step 3: Copy updated compose file to EC2 ───────────────────────────
       - name: Copy docker-compose to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -47,6 +85,7 @@ jobs:
           source: "docker-compose.aws.yml"
           target: "~/"
 
+      # ─── Step 4: Deploy on EC2 ───────────────────────────────────────────────
       - name: Deploy to AWS EC2 via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -54,10 +93,9 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            # Project directory ensure karo
             mkdir -p ~/ai-voice-interview
 
-            # .env file fresh banao (secrets se)
+            # .env file fresh banao
             cat > ~/ai-voice-interview/.env << 'ENVEOF'
             DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
             RDS_WRITER_URL=${{ secrets.RDS_WRITER_URL }}
@@ -66,18 +104,13 @@ jobs:
             SALAD_API_SECRET=${{ secrets.SALAD_API_SECRET }}
             ENVEOF
 
-            # Verify .env bana
-            echo "✅ .env file:"
-            cat ~/ai-voice-interview/.env
-
             # Latest images pull karo
             docker pull ${{ secrets.DOCKERHUB_USERNAME }}/interview-aws-backend:latest
             docker pull ${{ secrets.DOCKERHUB_USERNAME }}/interview-frontend:latest
 
-            # Purane containers band karo aur naye start karo
+            # Restart containers
             docker compose -f ~/docker-compose.aws.yml --env-file ~/ai-voice-interview/.env down
             docker compose -f ~/docker-compose.aws.yml --env-file ~/ai-voice-interview/.env up -d
 
-            # Status check
-            echo "🚀 Running containers:"
-            docker ps
+            echo "✅ Containers running:"
+            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
