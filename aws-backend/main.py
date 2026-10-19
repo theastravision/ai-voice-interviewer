@@ -77,32 +77,51 @@ async def ws_receive(websocket: WebSocket) -> dict | None:
     return msg
 
 
-async def post_salad(path: str, payload: dict) -> tuple[bool, dict]:
+SALAD_CHAT_PATHS = ("/chat-reply", "/free-chat")
+
+
+async def post_salad(path: str, payload: dict, *, alt_paths: tuple[str, ...] = ()) -> tuple[bool, dict]:
     """POST to Salad GPU. Returns (ok, json_body_or_error_detail)."""
-    url = f"{SALAD_GATEWAY_URL}{path}"
-    try:
-        resp = await http_client.post(
-            url,
-            json=payload,
-            headers={"x-api-key": SALAD_API_SECRET},
+    paths = (path,) + alt_paths
+    last_status = 0
+    last_detail = ""
+
+    for p in paths:
+        url = f"{SALAD_GATEWAY_URL}{p}"
+        try:
+            resp = await http_client.post(
+                url,
+                json=payload,
+                headers={"x-api-key": SALAD_API_SECRET},
+            )
+        except httpx.HTTPError as exc:
+            logger.error("Salad unreachable %s: %s", url, exc)
+            return False, {"detail": f"Cannot reach AI GPU at {SALAD_GATEWAY_URL}. Check SALAD_GATEWAY_URL on EC2."}
+
+        if resp.status_code == 200:
+            try:
+                return True, resp.json()
+            except json.JSONDecodeError:
+                logger.error("Salad %s returned non-JSON: %s", p, resp.text[:200])
+                return False, {"detail": "GPU returned an invalid response."}
+
+        last_status = resp.status_code
+        last_detail = resp.text[:200]
+        if resp.status_code == 404 and p != paths[-1]:
+            logger.warning("Salad %s HTTP 404, trying alternate path…", p)
+            continue
+        logger.error("Salad %s HTTP %s: %s", p, resp.status_code, resp.text[:800])
+        break
+
+    detail = last_detail
+    if last_status == 401:
+        detail = "Invalid SALAD_API_SECRET (401 from GPU gateway)."
+    elif last_status == 404:
+        detail = (
+            "GPU container is missing /chat-reply (404). "
+            "Redeploy Salad Cloud with the latest interview-salad-gpu Docker image."
         )
-    except httpx.HTTPError as exc:
-        logger.error("Salad unreachable %s: %s", url, exc)
-        return False, {"detail": f"Cannot reach AI GPU at {SALAD_GATEWAY_URL}. Check SALAD_GATEWAY_URL on EC2."}
-
-    if resp.status_code != 200:
-        logger.error("Salad %s HTTP %s: %s", path, resp.status_code, resp.text[:800])
-        detail = resp.text[:200]
-        if resp.status_code == 401:
-            detail = "Invalid SALAD_API_SECRET (401 from GPU gateway)."
-        return False, {"detail": detail, "status_code": resp.status_code}
-
-    try:
-        return True, resp.json()
-    except json.JSONDecodeError:
-        logger.error("Salad %s returned non-JSON: %s", path, resp.text[:200])
-        return False, {"detail": "GPU returned an invalid response."}
-
+    return False, {"detail": detail, "status_code": last_status}
 
 def salad_user_error(failure: dict) -> str:
     detail = failure.get("detail", "")
@@ -110,12 +129,35 @@ def salad_user_error(failure: dict) -> str:
         return "Cannot reach the AI GPU. On EC2, verify SALAD_GATEWAY_URL in ~/ai-voice-interview/.env points to your Salad gateway."
     if failure.get("status_code") == 401 or "SALAD_API_SECRET" in detail:
         return "AI GPU rejected the API key. Ensure SALAD_API_SECRET matches on EC2 and Salad Cloud."
-    return "Sorry — the AI GPU had an error. Check aws-backend logs (docker logs aws-backend)."
+    if failure.get("status_code") == 404 or "missing /chat-reply" in detail:
+        return (
+            "Salad GPU is running an old image without Free Chat. "
+            "In Salad Cloud, redeploy container image "
+            "DOCKERHUB_USER/interview-salad-gpu:latest (push from CI or docker pull + restart)."
+        )
+    return f"Sorry — the AI GPU had an error. {detail[:120] if detail else 'Check aws-backend logs.'}"
 
 
 @app.on_event("startup")
 async def startup_event():
     logger.info("Salad gateway URL: %s", SALAD_GATEWAY_URL)
+    try:
+        resp = await http_client.get(f"{SALAD_GATEWAY_URL}/health", timeout=15.0)
+        if resp.status_code == 200:
+            data = resp.json()
+            routes = data.get("routes") or []
+            if "/chat-reply" not in routes and "/free-chat" not in routes:
+                logger.error(
+                    "Salad GPU health OK but missing Free Chat routes (%s). "
+                    "Redeploy interview-salad-gpu:latest on Salad Cloud.",
+                    routes,
+                )
+            else:
+                logger.info("Salad GPU api_version=%s routes=%s", data.get("api_version"), routes)
+        else:
+            logger.warning("Salad health check HTTP %s", resp.status_code)
+    except httpx.HTTPError as exc:
+        logger.warning("Salad health check failed at startup: %s", exc)
     async with writer_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -129,12 +171,25 @@ async def diagnostics():
     """Quick check for Salad connectivity (open /api/diagnostics in the browser)."""
     salad_ok = False
     salad_detail = ""
+    salad_routes: list[str] = []
+    salad_api_version = ""
+    salad_tts_engine = ""
     try:
         resp = await http_client.get(f"{SALAD_GATEWAY_URL}/health", timeout=10.0)
         salad_ok = resp.status_code == 200
         salad_detail = resp.text[:300]
+        if salad_ok:
+            try:
+                health = resp.json()
+                salad_routes = health.get("routes") or []
+                salad_api_version = health.get("api_version") or ""
+                salad_tts_engine = health.get("tts_engine") or ""
+            except json.JSONDecodeError:
+                pass
     except httpx.HTTPError as exc:
         salad_detail = str(exc)
+
+    chat_route_ok = "/chat-reply" in salad_routes or "/free-chat" in salad_routes
 
     auth_probe_ok = False
     auth_detail = ""
@@ -156,6 +211,10 @@ async def diagnostics():
         "salad_gateway_url": SALAD_GATEWAY_URL,
         "salad_health_ok": salad_ok,
         "salad_health_detail": salad_detail,
+        "salad_api_version": salad_api_version,
+        "salad_tts_engine": salad_tts_engine,
+        "salad_routes": salad_routes,
+        "salad_has_free_chat": chat_route_ok,
         "salad_auth_ok": auth_probe_ok,
         "salad_auth_detail": auth_detail,
         "rds_writer_configured": bool(os.getenv("RDS_WRITER_URL")),
@@ -245,6 +304,7 @@ async def interview_ws(websocket: WebSocket, session_id: str, sr: int = 16000, l
         wav_bytes = base64.b64decode(tts_data["tts_wav_b64"])
         pcm_out = await asyncio.to_thread(dsp.process_salad_tts_wav, wav_bytes, sr)
         ai_speaking = True
+        await ws_send_json(websocket, {"type": "status", "status": "ai_speaking"})
         await ws_send_bytes(websocket, pcm_out)
         await ws_send_json(websocket, {"type": "status", "status": "ai_done_speaking"})
         ai_speaking = False
@@ -371,6 +431,7 @@ async def interview_ws(websocket: WebSocket, session_id: str, sr: int = 16000, l
                     wav_bytes = base64.b64decode(tts_b64)
                     pcm_out = await asyncio.to_thread(dsp.process_salad_tts_wav, wav_bytes, sr)
                     ai_speaking = True
+                    await ws_send_json(websocket, {"type": "status", "status": "ai_speaking"})
                     await ws_send_bytes(websocket, pcm_out)
                     await ws_send_json(websocket, {"type": "status", "status": "ai_done_speaking"})
                     ai_speaking = False
@@ -389,6 +450,8 @@ async def chat_ws(websocket: WebSocket, sr: int = 16000, lang: str = "en-in"):
     speech_lang = normalize_speech_lang(lang)
     dsp = AudioDSPPipeline()
     chat_history: list[dict] = []
+    voice_session = False
+    speak_replies = False
 
     audio_buffer = bytearray()
     is_speaking = False
@@ -409,7 +472,9 @@ async def chat_ws(websocket: WebSocket, sr: int = 16000, lang: str = "en-in"):
     if ok_tts and tts_data.get("tts_wav_b64"):
         wav_bytes = base64.b64decode(tts_data["tts_wav_b64"])
         pcm_out = await asyncio.to_thread(dsp.process_salad_tts_wav, wav_bytes, sr)
+        await ws_send_json(websocket, {"type": "status", "status": "ai_speaking"})
         await ws_send_bytes(websocket, pcm_out)
+        await ws_send_json(websocket, {"type": "status", "status": "ai_done_speaking"})
 
     try:
         while True:
@@ -423,6 +488,12 @@ async def chat_ws(websocket: WebSocket, sr: int = 16000, lang: str = "en-in"):
                 data = json.loads(msg["text"])
                 if data.get("type") == "chat_message":
                     user_text_input = data.get("text", "").strip()
+                    if data.get("speak_replies") is not None:
+                        speak_replies = bool(data.get("speak_replies"))
+                elif data.get("type") == "voice_session":
+                    voice_session = True
+                    speak_replies = bool(data.get("speak_replies", True))
+                    continue
                 elif data.get("type") == "set_language":
                     speech_lang = normalize_speech_lang(data.get("lang"))
                     continue
@@ -458,15 +529,18 @@ async def chat_ws(websocket: WebSocket, sr: int = 16000, lang: str = "en-in"):
             if user_text_input or clean_pcm16_b64:
                 await websocket.send_json({"type": "status", "status": "processing"})
                 text_only = bool(user_text_input and not clean_pcm16_b64)
+                skip_tts = text_only and not (voice_session and speak_replies)
                 ok, resp_data = await post_salad(
                     "/chat-reply",
                     {
                         "pcm16_base64": clean_pcm16_b64,
                         "chat_text": user_text_input,
                         "history": chat_history[-6:],
-                        "skip_tts": text_only,
+                        "skip_tts": skip_tts,
+                        "speak_replies": speak_replies,
                         "speech_lang": speech_lang,
                     },
+                    alt_paths=SALAD_CHAT_PATHS[1:],
                 )
                 if not ws_connected(websocket):
                     break
@@ -505,7 +579,9 @@ async def chat_ws(websocket: WebSocket, sr: int = 16000, lang: str = "en-in"):
                 if tts_b64 and ws_connected(websocket):
                     wav_bytes = base64.b64decode(tts_b64)
                     pcm_out = await asyncio.to_thread(dsp.process_salad_tts_wav, wav_bytes, sr)
+                    await ws_send_json(websocket, {"type": "status", "status": "ai_speaking"})
                     await ws_send_bytes(websocket, pcm_out)
+                    await ws_send_json(websocket, {"type": "status", "status": "ai_done_speaking"})
 
     except (WebSocketDisconnect, RuntimeError):
         pass

@@ -4,45 +4,91 @@ import json
 import re
 import uuid
 import base64
+import logging
 import numpy as np
 import soundfile as sf
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from faster_whisper import WhisperModel
 from kokoro_onnx import Kokoro
 from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
 
-app = FastAPI(title="Salad Cloud GPU Inference Node")
-API_SECRET = os.getenv("SALAD_API_SECRET", "my-super-secret-salad-key")
+import indic_tts
 
-stt_model = WhisperModel("small", device="cuda", compute_type="int8")
+API_SECRET = os.getenv("SALAD_API_SECRET", "my-super-secret-salad-key")
+API_VERSION = "2025-10-20-indic"
+logger = logging.getLogger("uvicorn.error")
+
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "small")
+VLLM_GPU_UTIL = float(os.getenv("VLLM_GPU_MEMORY_UTIL", "0.48"))
+
+stt_model = WhisperModel(WHISPER_MODEL_SIZE, device="cuda", compute_type="int8")
 tts_model = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
 
 engine_args = AsyncEngineArgs(
     model="Qwen/Qwen2.5-3B-Instruct-AWQ",
     quantization="awq",
-    gpu_memory_utilization=0.55,
-    max_model_len=6144
+    gpu_memory_utilization=VLLM_GPU_UTIL,
+    max_model_len=6144,
 )
 llm_engine = AsyncLLMEngine.from_engine_args(engine_args)
 
-# speech_lang from frontend → Whisper + Kokoro settings
 SPEECH_LANG_CONFIG: dict[str, dict[str, str]] = {
-    "en-in": {"whisper": "en", "tts_lang": "en-gb", "tts_voice": "hm_psi", "llm_hint": "Indian English"},
-    "hi": {"whisper": "hi", "tts_lang": "hi", "tts_voice": "hm_psi", "llm_hint": "Hindi (Devanagari)"},
-    "mr": {"whisper": "mr", "tts_lang": "hi", "tts_voice": "hm_psi", "llm_hint": "Marathi (Devanagari)"},
-    "gu": {"whisper": "gu", "tts_lang": "hi", "tts_voice": "hm_psi", "llm_hint": "Gujarati (Gujarati script)"},
+    "en-in": {
+        "whisper": "en",
+        "whisper_prompt": "Indian English conversation, clear pronunciation.",
+        "kokoro_lang": "hi",
+        "kokoro_voice": "hm_omega",
+        "llm_hint": "Indian English (natural spoken Indian phrasing, short sentences)",
+    },
+    "hi": {
+        "whisper": "hi",
+        "whisper_prompt": "हिंदी बातचीत, स्पष्ट उच्चारण।",
+        "kokoro_lang": "hi",
+        "kokoro_voice": "hm_omega",
+        "llm_hint": "Hindi in Devanagari script, conversational",
+    },
+    "mr": {
+        "whisper": "mr",
+        "whisper_prompt": "मराठी संभाषण, स्पष्ट उच्चार.",
+        "kokoro_lang": "hi",
+        "kokoro_voice": "hm_omega",
+        "llm_hint": "Marathi in Devanagari script, conversational",
+    },
+    "gu": {
+        "whisper": "gu",
+        "whisper_prompt": "ગુજરાતી વાતચીત, સ્પષ્ટ ઉચ્ચાર.",
+        "kokoro_lang": "hi",
+        "kokoro_voice": "hf_alpha",
+        "llm_hint": "Gujarati in Gujarati script, conversational",
+    },
 }
 DEFAULT_SPEECH_LANG = "en-in"
+IM_END = "<|" + "im_end" + "|>"
+USE_INDIC_PARLER = os.getenv("USE_INDIC_PARLER", "1") != "0"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if USE_INDIC_PARLER:
+        indic_tts.preload_indic_tts()
+    yield
+
+
+app = FastAPI(title="Salad Cloud GPU Inference Node", lifespan=lifespan)
+
 
 def normalize_speech_lang(lang: str | None) -> str:
     if lang and lang in SPEECH_LANG_CONFIG:
         return lang
     return DEFAULT_SPEECH_LANG
 
+
 def check_auth(key: str):
     if key != API_SECRET:
         raise HTTPException(status_code=401, detail="Invalid API Key")
+
 
 def transcribe_audio(f32: np.ndarray, speech_lang: str) -> str:
     cfg = SPEECH_LANG_CONFIG[normalize_speech_lang(speech_lang)]
@@ -51,92 +97,148 @@ def transcribe_audio(f32: np.ndarray, speech_lang: str) -> str:
         beam_size=1,
         without_timestamps=True,
         language=cfg["whisper"],
+        initial_prompt=cfg["whisper_prompt"],
     )
     return " ".join([s.text for s in segs]).strip()
 
-def generate_tts(text: str, speech_lang: str | None = None) -> str:
-    """Generate TTS audio and return base64 WAV."""
+
+def _kokoro_tts_b64(text: str, speech_lang: str) -> str:
     cfg = SPEECH_LANG_CONFIG[normalize_speech_lang(speech_lang)]
     samples, sr = tts_model.create(
-        text, voice=cfg["tts_voice"], speed=1.05, lang=cfg["tts_lang"]
+        text, voice=cfg["kokoro_voice"], speed=1.05, lang=cfg["kokoro_lang"]
     )
     buf = io.BytesIO()
     sf.write(buf, samples, sr, format="WAV", subtype="PCM_16")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
+
+def generate_tts(text: str, speech_lang: str | None = None) -> str:
+    lang = normalize_speech_lang(speech_lang)
+    if USE_INDIC_PARLER:
+        try:
+            return indic_tts.synthesize_to_wav_b64(text, lang)
+        except Exception as exc:
+            logger.warning("Indic Parler TTS failed, Kokoro fallback: %s", exc)
+    return _kokoro_tts_b64(text, lang)
+
+
 def llm_language_instruction(speech_lang: str | None) -> str:
     cfg = SPEECH_LANG_CONFIG[normalize_speech_lang(speech_lang)]
-    return f"Always respond in {cfg['llm_hint']}."
+    return (
+        f"Always respond in {cfg['llm_hint']}. "
+        "Use natural spoken language suitable for voice conversation (short sentences)."
+    )
+
 
 @app.get("/health")
 async def health():
-    return {"status": "ready"}
+    routes = sorted({getattr(r, "path", "") for r in app.routes if getattr(r, "path", "")})
+    return {
+        "status": "ready",
+        "api_version": API_VERSION,
+        "tts_engine": "indic-parler" if USE_INDIC_PARLER else "kokoro",
+        "whisper_model": WHISPER_MODEL_SIZE,
+        "routes": routes,
+    }
 
-# ─── Common JSON repair ─────────────────────────────────────────────
+
+async def llm_generate(prompt: str, *, max_tokens: int, temperature: float) -> str:
+    params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
+    out = None
+    async for res in llm_engine.generate(prompt, params, uuid.uuid4().hex):
+        out = res
+    if out is None or not out.outputs:
+        raise HTTPException(status_code=503, detail="LLM returned no output")
+    return out.outputs[0].text.strip()
+
+
+def safe_tts(text: str, speech_lang: str | None, skip: bool = False) -> str:
+    if skip or not text.strip():
+        return ""
+    try:
+        return generate_tts(text, speech_lang)
+    except Exception as exc:
+        logger.exception("TTS failed: %s", exc)
+        return ""
+
+
 class QARequest(BaseModel):
     context: str
 
+
 def repair_json(raw: str) -> dict:
-    """Try to fix common LLM JSON issues and parse."""
-    text = re.sub(r',\s*([}\]])', r'\1', raw)
+    text = re.sub(r",\s*([}\]])", r"\1", raw)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    open_braces = text.count('{') - text.count('}')
-    open_brackets = text.count('[') - text.count(']')
-    last_complete = text.rfind('}')
+    open_braces = text.count("{") - text.count("}")
+    open_brackets = text.count("[") - text.count("]")
+    last_complete = text.rfind("}")
     if last_complete > 0:
-        truncated = text[:last_complete + 1]
-        truncated += ']' * max(0, open_brackets) + '}' * max(0, open_braces - 1)
-        truncated = re.sub(r',\s*([}\]])', r'\1', truncated)
+        truncated = text[: last_complete + 1]
+        truncated += "]" * max(0, open_brackets) + "}" * max(0, open_braces - 1)
+        truncated = re.sub(r",\s*([}\]])", r"\1", truncated)
         try:
             return json.loads(truncated)
         except json.JSONDecodeError:
             pass
     raise ValueError("Could not parse LLM JSON output")
 
-# ─── Generate 15 Q&A ────────────────────────────────────────────────
+
 @app.post("/generate-15-qa")
 async def generate_15_qa(req: QARequest, x_api_key: str = Header(...)):
     check_auth(x_api_key)
+    if not req.context.strip():
+        raise HTTPException(status_code=400, detail="Empty resume/JD context")
     prompt = f"""<|im_start|>system
 You are a Senior Technical Interviewer. Based on the Resume and Job Description context below, output ONLY valid JSON containing 15 technical questions and concise reference answers:
 {{"questions": [{{"id": 1, "question": "...", "reference_answer": "..."}}]}}
 Context:
-{req.context}<|im_end|>
+{req.context}
+{IM_END}
 <|im_start|>assistant
 {{"""
 
     max_retries = 2
     last_error = None
     for attempt in range(max_retries + 1):
-        params = SamplingParams(temperature=0.2 + (attempt * 0.1), max_tokens=3500)
-        out = None
-        async for res in llm_engine.generate(prompt, params, uuid.uuid4().hex):
-            out = res
-        raw_text = "{" + out.outputs[0].text.strip()
         try:
+            body = await llm_generate(prompt, max_tokens=3500, temperature=0.2 + (attempt * 0.1))
+            raw_text = "{" + body
             start, end = raw_text.find("{"), raw_text.rfind("}")
-            parsed = repair_json(raw_text[start:end+1])
+            if start < 0 or end <= start:
+                raise ValueError("Model output contained no JSON object")
+            parsed = repair_json(raw_text[start : end + 1])
+            if not parsed.get("questions"):
+                raise ValueError("JSON had no questions array")
             return parsed
-        except (json.JSONDecodeError, ValueError) as e:
+        except HTTPException:
+            raise
+        except (json.JSONDecodeError, ValueError, IndexError, AttributeError) as e:
             last_error = str(e)
+            logger.warning("generate-15-qa attempt %s failed: %s", attempt + 1, last_error)
             continue
 
     raise HTTPException(status_code=500, detail=f"JSON parse failed after {max_retries+1} attempts: {last_error}")
 
-# ─── TTS Only ────────────────────────────────────────────────────────
+
 class TTSRequest(BaseModel):
     text: str
     speech_lang: str | None = DEFAULT_SPEECH_LANG
 
+
 @app.post("/tts-only")
 async def tts_only(req: TTSRequest, x_api_key: str = Header(...)):
     check_auth(x_api_key)
-    return {"tts_wav_b64": generate_tts(req.text, req.speech_lang)}
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="Empty TTS text")
+    tts_b64 = safe_tts(req.text, req.speech_lang)
+    if not tts_b64:
+        raise HTTPException(status_code=500, detail="TTS synthesis failed")
+    return {"tts_wav_b64": tts_b64}
 
-# ─── Interview Turn (STRICT mode) ───────────────────────────────────
+
 STRICT_INTERVIEWER_RULES = """STRICT RULES — you MUST follow these:
 1. You are ONLY an interviewer. Your ONLY job is to ask questions and give brief feedback.
 2. NEVER answer any technical question from the candidate.
@@ -149,6 +251,7 @@ STRICT_INTERVIEWER_RULES = """STRICT RULES — you MUST follow these:
 9. Then ask the next question verbatim.
 10. Under 50 words total."""
 
+
 class TurnRequest(BaseModel):
     pcm16_base64: str | None = None
     chat_text: str | None = None
@@ -156,6 +259,7 @@ class TurnRequest(BaseModel):
     reference_answer: str
     next_question: str | None = None
     speech_lang: str | None = DEFAULT_SPEECH_LANG
+
 
 @app.post("/process-turn")
 async def process_turn(req: TurnRequest, x_api_key: str = Header(...)):
@@ -178,39 +282,34 @@ async def process_turn(req: TurnRequest, x_api_key: str = Header(...)):
             f"Reference Answer: {req.reference_answer}\n"
             f"Candidate said: {user_text}\n"
             f"Give 1 brief sentence of feedback, then ask verbatim: \"{req.next_question}\".\n"
-            f"<|im_end|>\n<|im_start|>assistant\n"
+            f"{IM_END}\n<|im_start|>assistant\n"
         )
     else:
         prompt = (
             f"<|im_start|>system\n{STRICT_INTERVIEWER_RULES}\n{lang_rule}\n"
             f"Candidate answered the final question: \"{user_text}\". "
             f"Thank them warmly in 2 sentences. Do not answer any questions.\n"
-            f"<|im_end|>\n<|im_start|>assistant\n"
+            f"{IM_END}\n<|im_start|>assistant\n"
         )
 
-    params = SamplingParams(temperature=0.3, max_tokens=120)
-    out = None
-    async for res in llm_engine.generate(prompt, params, uuid.uuid4().hex):
-        out = res
-    ai_reply = out.outputs[0].text.strip()
-
+    ai_reply = await llm_generate(prompt, max_tokens=120, temperature=0.3)
     return {
         "user_transcript": user_text,
         "ai_text": ai_reply,
-        "tts_wav_b64": generate_tts(ai_reply, speech_lang),
+        "tts_wav_b64": safe_tts(ai_reply, speech_lang),
     }
 
-# ─── Free Chat (multilingual conversational) ────────────────────────
+
 class ChatRequest(BaseModel):
     pcm16_base64: str | None = None
     chat_text: str | None = None
     history: list[dict] | None = None
     skip_tts: bool = False
     speech_lang: str | None = DEFAULT_SPEECH_LANG
+    speak_replies: bool = False
 
-@app.post("/chat-reply")
-async def chat_reply(req: ChatRequest, x_api_key: str = Header(...)):
-    check_auth(x_api_key)
+
+async def _chat_reply_handler(req: ChatRequest) -> dict:
     speech_lang = normalize_speech_lang(req.speech_lang)
     user_text = req.chat_text
     if req.pcm16_base64:
@@ -221,12 +320,11 @@ async def chat_reply(req: ChatRequest, x_api_key: str = Header(...)):
     if not user_text:
         return {"user_transcript": "", "ai_text": "", "tts_wav_b64": ""}
 
-    # Build conversation history
     history_str = ""
     if req.history:
-        for msg in req.history[-6:]:  # last 6 messages for context
+        for msg in req.history[-6:]:
             role = "user" if msg.get("role") == "user" else "assistant"
-            history_str += f"<|im_start|>{role}\n{msg.get('text', '')}<|im_end|>\n"
+            history_str += f"<|im_start|>{role}\n{msg.get('text', '')}\n{IM_END}\n"
 
     lang_rule = llm_language_instruction(speech_lang)
     prompt = (
@@ -235,20 +333,29 @@ async def chat_reply(req: ChatRequest, x_api_key: str = Header(...)):
         f"{lang_rule} Be conversational, warm, and helpful. "
         "You can discuss any topic freely — technology, culture, sports, philosophy, anything. "
         "Keep responses concise (under 60 words) and natural.\n"
-        "<|im_end|>\n"
+        f"{IM_END}\n"
         f"{history_str}"
-        f"<|im_start|>user\n{user_text}<|im_end|>\n"
+        f"<|im_start|>user\n{user_text}\n{IM_END}\n"
         "<|im_start|>assistant\n"
     )
 
-    params = SamplingParams(temperature=0.7, max_tokens=150)
-    out = None
-    async for res in llm_engine.generate(prompt, params, uuid.uuid4().hex):
-        out = res
-    ai_reply = out.outputs[0].text.strip()
+    ai_reply = await llm_generate(prompt, max_tokens=150, temperature=0.7)
+    skip = req.skip_tts and not req.pcm16_base64 and not req.speak_replies
 
     return {
         "user_transcript": user_text,
         "ai_text": ai_reply,
-        "tts_wav_b64": "" if req.skip_tts else generate_tts(ai_reply, speech_lang),
+        "tts_wav_b64": safe_tts(ai_reply, speech_lang, skip=skip),
     }
+
+
+@app.post("/chat-reply")
+async def chat_reply(req: ChatRequest, x_api_key: str = Header(...)):
+    check_auth(x_api_key)
+    return await _chat_reply_handler(req)
+
+
+@app.post("/free-chat")
+async def free_chat_alias(req: ChatRequest, x_api_key: str = Header(...)):
+    check_auth(x_api_key)
+    return await _chat_reply_handler(req)

@@ -82,6 +82,59 @@ function pcmToAudioBuffer(audioCtx: AudioContext, pcmBytes: ArrayBuffer, sr: num
   return buf;
 }
 
+type TtsQueue = { enqueue: (pcm: ArrayBuffer) => void; stop: () => void };
+
+function createTtsQueue(
+  getCtx: () => AudioContext | null,
+  sr: number,
+  sourceRef: React.MutableRefObject<AudioBufferSourceNode | null>,
+  onSpeaking: (speaking: boolean) => void,
+  blockMicRef: React.MutableRefObject<boolean>,
+): TtsQueue {
+  const pending: ArrayBuffer[] = [];
+  let playing = false;
+
+  const pump = () => {
+    const ctx = getCtx();
+    if (playing || pending.length === 0 || !ctx) return;
+    playing = true;
+    blockMicRef.current = true;
+    onSpeaking(true);
+    void ctx.resume();
+    const pcm = pending.shift()!;
+    const buf = pcmToAudioBuffer(ctx, pcm, sr);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    sourceRef.current = src;
+    src.onended = () => {
+      sourceRef.current = null;
+      playing = false;
+      if (pending.length === 0) {
+        blockMicRef.current = false;
+        onSpeaking(false);
+      }
+      pump();
+    };
+    src.start();
+  };
+
+  return {
+    enqueue(pcm: ArrayBuffer) {
+      pending.push(pcm);
+      pump();
+    },
+    stop() {
+      pending.length = 0;
+      try { sourceRef.current?.stop(); } catch { /* stopped */ }
+      sourceRef.current = null;
+      playing = false;
+      blockMicRef.current = false;
+      onSpeaking(false);
+    },
+  };
+}
+
 /* ─── Theme ──────────────────────────────────────────────────────── */
 const T = {
   bg: "#06080f", card: "rgba(15,23,42,0.85)", glass: "rgba(30,41,59,0.55)",
@@ -193,6 +246,9 @@ function InterviewPanel({ speechLang }: { speechLang: SpeechLang }) {
   const animRef = useRef(0);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const speechLangRef = useRef(speechLang);
+  const blockMicDuringAiRef = useRef(false);
+  const ttsQueueRef = useRef<TtsQueue | null>(null);
+  const interviewSrRef = useRef<16000 | 8000>(16000);
 
   useEffect(() => { speechLangRef.current = speechLang; }, [speechLang]);
   useEffect(() => {
@@ -216,21 +272,11 @@ function InterviewPanel({ speechLang }: { speechLang: SpeechLang }) {
   }, []);
 
   const stopTtsPlayback = () => {
-    try { ttsSourceRef.current?.stop(); } catch {}
+    ttsQueueRef.current?.stop();
+    try { ttsSourceRef.current?.stop(); } catch { /* stopped */ }
     ttsSourceRef.current = null;
+    blockMicDuringAiRef.current = false;
     setAiSpeaking(false);
-  };
-
-  const playTts = (audioCtx: AudioContext, pcmBytes: ArrayBuffer, sr: number) => {
-    void audioCtx.resume();
-    const buf = pcmToAudioBuffer(audioCtx, pcmBytes, sr);
-    const src = audioCtx.createBufferSource();
-    src.buffer = buf;
-    src.connect(audioCtx.destination);
-    ttsSourceRef.current = src;
-    setAiSpeaking(true);
-    src.onended = () => { ttsSourceRef.current = null; setAiSpeaking(false); };
-    src.start();
   };
 
   const handleInit = async () => {
@@ -264,6 +310,7 @@ function InterviewPanel({ speechLang }: { speechLang: SpeechLang }) {
     );
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
+    interviewSrRef.current = sr;
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
@@ -283,11 +330,12 @@ function InterviewPanel({ speechLang }: { speechLang: SpeechLang }) {
           if (m.status === "listening") setSttStatus("listening");
           else if (m.status === "processing") { setSttStatus("processing"); setAiThinking(true); }
           else if (m.status === "idle") { setSttStatus("idle"); setAiThinking(false); }
-          else if (m.status === "ai_done_speaking") setAiSpeaking(false);
+          else if (m.status === "ai_speaking") setAiSpeaking(true);
+          else if (m.status === "ai_done_speaking") { blockMicDuringAiRef.current = false; setAiSpeaking(false); }
           else if (m.status === "interrupted") { stopTtsPlayback(); setSttStatus("listening"); }
         }
-      } else if (ev.data instanceof ArrayBuffer && audioCtxRef.current) {
-        playTts(audioCtxRef.current, ev.data, sr);
+      } else if (ev.data instanceof ArrayBuffer) {
+        ttsQueueRef.current?.enqueue(ev.data);
       }
     };
     ws.onclose = () => {
@@ -309,6 +357,13 @@ function InterviewPanel({ speechLang }: { speechLang: SpeechLang }) {
       audioCtxRef.current = mic.audioCtx;
       streamRef.current = mic.stream;
       analyserRef.current = mic.analyser;
+      ttsQueueRef.current = createTtsQueue(
+        () => audioCtxRef.current,
+        sr,
+        ttsSourceRef,
+        setAiSpeaking,
+        blockMicDuringAiRef,
+      );
       detachPcmRef.current = mic.attachPcmSender((pcm) => {
         if (ws.readyState !== WebSocket.OPEN || !micActiveRef.current) return;
         const int16 = new Int16Array(pcm);
@@ -318,10 +373,12 @@ function InterviewPanel({ speechLang }: { speechLang: SpeechLang }) {
           sum += v * v;
         }
         const rms = Math.sqrt(sum / int16.length);
-        if (rms > 0.02 && ttsSourceRef.current) {
+        if (blockMicDuringAiRef.current && rms <= 0.02) return;
+        if (rms > 0.02 && (ttsSourceRef.current || blockMicDuringAiRef.current)) {
           stopTtsPlayback();
           ws.send(JSON.stringify({ type: "interrupt" }));
         }
+        if (blockMicDuringAiRef.current) return;
         ws.send(pcm);
       });
       setMicActive(true);
@@ -354,6 +411,8 @@ function InterviewPanel({ speechLang }: { speechLang: SpeechLang }) {
     streamRef.current = null;
     audioCtxRef.current?.close().catch(() => {});
     audioCtxRef.current = null;
+    ttsQueueRef.current?.stop();
+    ttsQueueRef.current = null;
     stopTtsPlayback();
     setConnected(false);
     setMicActive(false);
@@ -477,6 +536,10 @@ function ChatPanel({ speechLang }: { speechLang: SpeechLang }) {
   const animRef = useRef(0);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const speechLangRef = useRef(speechLang);
+  const speakRepliesRef = useRef(true);
+  const blockMicDuringAiRef = useRef(false);
+  const ttsQueueRef = useRef<TtsQueue | null>(null);
+  const chatSrRef = useRef<16000 | 8000>(16000);
 
   useEffect(() => { speechLangRef.current = speechLang; }, [speechLang]);
   useEffect(() => {
@@ -495,8 +558,10 @@ function ChatPanel({ speechLang }: { speechLang: SpeechLang }) {
   }, []);
 
   const stopTts = () => {
+    ttsQueueRef.current?.stop();
     try { ttsSourceRef.current?.stop(); } catch { /* already stopped */ }
     ttsSourceRef.current = null;
+    blockMicDuringAiRef.current = false;
     setAiSpeaking(false);
   };
 
@@ -512,6 +577,7 @@ function ChatPanel({ speechLang }: { speechLang: SpeechLang }) {
     );
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
+    chatSrRef.current = sr;
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
@@ -527,17 +593,11 @@ function ChatPanel({ speechLang }: { speechLang: SpeechLang }) {
           if (m.status === "listening") setSttStatus("listening");
           else if (m.status === "processing") { setSttStatus("processing"); setAiThinking(true); }
           else if (m.status === "idle") { setSttStatus("idle"); setAiThinking(false); }
+          else if (m.status === "ai_speaking") setAiSpeaking(true);
+          else if (m.status === "ai_done_speaking") { blockMicDuringAiRef.current = false; setAiSpeaking(false); }
         }
-      } else if (ev.data instanceof ArrayBuffer && audioCtxRef.current) {
-        void audioCtxRef.current.resume();
-        const buf = pcmToAudioBuffer(audioCtxRef.current, ev.data, sr);
-        const src = audioCtxRef.current.createBufferSource();
-        src.buffer = buf;
-        src.connect(audioCtxRef.current.destination);
-        ttsSourceRef.current = src;
-        setAiSpeaking(true);
-        src.onended = () => { ttsSourceRef.current = null; setAiSpeaking(false); };
-        src.start();
+      } else if (ev.data instanceof ArrayBuffer) {
+        ttsQueueRef.current?.enqueue(ev.data);
       }
     };
     ws.onclose = () => {
@@ -558,10 +618,20 @@ function ChatPanel({ speechLang }: { speechLang: SpeechLang }) {
       audioCtxRef.current = mic.audioCtx;
       streamRef.current = mic.stream;
       analyserRef.current = mic.analyser;
+      speakRepliesRef.current = true;
+      ttsQueueRef.current = createTtsQueue(
+        () => audioCtxRef.current,
+        sr,
+        ttsSourceRef,
+        setAiSpeaking,
+        blockMicDuringAiRef,
+      );
       detachPcmRef.current = mic.attachPcmSender((pcm) => {
         if (ws.readyState !== WebSocket.OPEN || !micActiveRef.current) return;
+        if (blockMicDuringAiRef.current) return;
         ws.send(pcm);
       });
+      ws.send(JSON.stringify({ type: "voice_session", speak_replies: true }));
       setMicActive(true);
       micActiveRef.current = true;
       startMeter(mic.analyser);
@@ -587,7 +657,11 @@ function ChatPanel({ speechLang }: { speechLang: SpeechLang }) {
     if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
     setAiThinking(true);
     setSttStatus("processing");
-    wsRef.current.send(JSON.stringify({ type: "chat_message", text }));
+    wsRef.current.send(JSON.stringify({
+      type: "chat_message",
+      text,
+      speak_replies: speakRepliesRef.current,
+    }));
     setMessages((p) => [...p, { role: "candidate-chat", text }]);
     setChatInput("");
   };
@@ -598,6 +672,8 @@ function ChatPanel({ speechLang }: { speechLang: SpeechLang }) {
     cancelAnimationFrame(animRef.current);
     detachPcmRef.current?.();
     detachPcmRef.current = null;
+    ttsQueueRef.current?.stop();
+    ttsQueueRef.current = null;
     stopTts();
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
