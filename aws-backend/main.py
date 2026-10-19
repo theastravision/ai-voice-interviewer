@@ -77,7 +77,12 @@ async def ws_receive(websocket: WebSocket) -> dict | None:
     return msg
 
 
-SALAD_CHAT_PATHS = ("/chat-reply", "/free-chat")
+SALAD_CHAT_PATHS = ("/chat-reply", "/free-chat", "/chat")
+
+
+async def post_salad_chat(payload: dict) -> tuple[bool, dict]:
+    """POST Free Chat to Salad; try every known chat path (old/new images)."""
+    return await post_salad(SALAD_CHAT_PATHS[0], payload, alt_paths=SALAD_CHAT_PATHS[1:])
 
 
 async def post_salad(path: str, payload: dict, *, alt_paths: tuple[str, ...] = ()) -> tuple[bool, dict]:
@@ -146,10 +151,11 @@ async def startup_event():
         if resp.status_code == 200:
             data = resp.json()
             routes = data.get("routes") or []
-            if "/chat-reply" not in routes and "/free-chat" not in routes:
+            if not any(p in routes for p in SALAD_CHAT_PATHS):
                 logger.error(
                     "Salad GPU health OK but missing Free Chat routes (%s). "
-                    "Redeploy interview-salad-gpu:latest on Salad Cloud.",
+                    "Redeploy interview-salad-gpu:latest on Salad Cloud "
+                    "(expect api_version >= 2026-03-23-free-chat).",
                     routes,
                 )
             else:
@@ -189,7 +195,26 @@ async def diagnostics():
     except httpx.HTTPError as exc:
         salad_detail = str(exc)
 
-    chat_route_ok = "/chat-reply" in salad_routes or "/free-chat" in salad_routes
+    chat_route_ok = any(p in salad_routes for p in SALAD_CHAT_PATHS)
+
+    chat_probe_ok = False
+    chat_probe_detail = ""
+    if chat_route_ok:
+        try:
+            probe_chat = await http_client.post(
+                f"{SALAD_GATEWAY_URL}/chat-reply",
+                json={"chat_text": "ping", "skip_tts": True, "speech_lang": "en-in"},
+                headers={"x-api-key": SALAD_API_SECRET},
+                timeout=120.0,
+            )
+            chat_probe_ok = probe_chat.status_code == 200
+            chat_probe_detail = f"HTTP {probe_chat.status_code}"
+            if not chat_probe_ok:
+                chat_probe_detail += f": {probe_chat.text[:120]}"
+        except httpx.HTTPError as exc:
+            chat_probe_detail = str(exc)
+    else:
+        chat_probe_detail = "chat routes missing on Salad /health"
 
     auth_probe_ok = False
     auth_detail = ""
@@ -215,6 +240,8 @@ async def diagnostics():
         "salad_tts_engine": salad_tts_engine,
         "salad_routes": salad_routes,
         "salad_has_free_chat": chat_route_ok,
+        "salad_chat_probe_ok": chat_probe_ok,
+        "salad_chat_probe_detail": chat_probe_detail,
         "salad_auth_ok": auth_probe_ok,
         "salad_auth_detail": auth_detail,
         "rds_writer_configured": bool(os.getenv("RDS_WRITER_URL")),
@@ -530,8 +557,7 @@ async def chat_ws(websocket: WebSocket, sr: int = 16000, lang: str = "en-in"):
                 await websocket.send_json({"type": "status", "status": "processing"})
                 text_only = bool(user_text_input and not clean_pcm16_b64)
                 skip_tts = text_only and not (voice_session and speak_replies)
-                ok, resp_data = await post_salad(
-                    "/chat-reply",
+                ok, resp_data = await post_salad_chat(
                     {
                         "pcm16_base64": clean_pcm16_b64,
                         "chat_text": user_text_input,
@@ -540,7 +566,6 @@ async def chat_ws(websocket: WebSocket, sr: int = 16000, lang: str = "en-in"):
                         "speak_replies": speak_replies,
                         "speech_lang": speech_lang,
                     },
-                    alt_paths=SALAD_CHAT_PATHS[1:],
                 )
                 if not ws_connected(websocket):
                     break

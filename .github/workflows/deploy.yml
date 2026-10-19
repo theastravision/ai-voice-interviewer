@@ -108,7 +108,7 @@ jobs:
             echo "✅ .env file created:"
             cat ~/ai-voice-interview/.env
 
-            # Latest images pull karo
+            # Latest images pull karo (backend always — Free Chat / diagnostics track Salad routes)
             docker pull ${{ secrets.DOCKERHUB_USERNAME }}/interview-aws-backend:latest
             docker pull ${{ secrets.DOCKERHUB_USERNAME }}/interview-frontend:latest
 

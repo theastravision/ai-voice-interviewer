@@ -29,6 +29,6 @@ After pushing to `main`, CI publishes `DOCKERHUB_USER/interview-salad-gpu:latest
    bash scripts/verify-salad-gateway.sh
    curl -s http://localhost/api/diagnostics | python3 -m json.tool
    ```
-3. Expect `salad_has_free_chat: true` and `salad_api_version` ≥ `2025-10-20-indic`.
+3. Expect `salad_has_free_chat: true`, `salad_chat_probe_ok: true`, and `salad_api_version` **`2026-03-23-free-chat`** (or newer).
 
 **First boot:** CPU Parler sidecar starts before the main API; startup can take several minutes while the model loads.

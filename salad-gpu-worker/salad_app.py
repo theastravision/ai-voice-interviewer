@@ -17,7 +17,8 @@ from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
 import indic_tts
 
 API_SECRET = os.getenv("SALAD_API_SECRET", "my-super-secret-salad-key")
-API_VERSION = "2025-10-20-indic"
+API_VERSION = "2026-03-23-free-chat"
+CHAT_HTTP_PATHS = ("/chat-reply", "/free-chat", "/chat")
 logger = logging.getLogger("uvicorn.error")
 
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "small")
@@ -73,6 +74,13 @@ USE_INDIC_PARLER = os.getenv("USE_INDIC_PARLER", "1") != "0"
 async def lifespan(app: FastAPI):
     if USE_INDIC_PARLER:
         indic_tts.preload_indic_tts()
+    paths = sorted({getattr(r, "path", "") for r in app.routes if getattr(r, "path", "")})
+    logger.info(
+        "Salad GPU ready api_version=%s chat_paths=%s all_routes=%s",
+        API_VERSION,
+        list(CHAT_HTTP_PATHS),
+        paths,
+    )
     yield
 
 
@@ -138,6 +146,8 @@ async def health():
         "api_version": API_VERSION,
         "tts_engine": "indic-parler" if USE_INDIC_PARLER else "kokoro",
         "whisper_model": WHISPER_MODEL_SIZE,
+        "has_free_chat": all(p in routes for p in CHAT_HTTP_PATHS[:2]),
+        "chat_paths": list(CHAT_HTTP_PATHS),
         "routes": routes,
     }
 
@@ -350,12 +360,8 @@ async def _chat_reply_handler(req: ChatRequest) -> dict:
 
 
 @app.post("/chat-reply")
-async def chat_reply(req: ChatRequest, x_api_key: str = Header(...)):
-    check_auth(x_api_key)
-    return await _chat_reply_handler(req)
-
-
 @app.post("/free-chat")
-async def free_chat_alias(req: ChatRequest, x_api_key: str = Header(...)):
+@app.post("/chat")
+async def chat_reply(req: ChatRequest, x_api_key: str = Header(...)):
     check_auth(x_api_key)
     return await _chat_reply_handler(req)
