@@ -51,6 +51,8 @@ jobs:
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/interview-salad-gpu:latest
           cache-from: type=gha,scope=salad
           cache-to:   type=gha,scope=salad,mode=max
+          secrets: |
+            HF_TOKEN=${{ secrets.HF_TOKEN }}
 
       # ── FastAPI Backend (only if aws-backend/ changed) ──
       - name: Build & Push AWS FastAPI Backend Image

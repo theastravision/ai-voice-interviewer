@@ -4,6 +4,10 @@ import io
 import os
 import re
 
+import hf_auth
+
+hf_auth.apply_hf_auth()
+
 import numpy as np
 import soundfile as sf
 import torch
