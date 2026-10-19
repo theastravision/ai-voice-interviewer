@@ -27,6 +27,16 @@ app.add_middleware(
 
 SALAD_GATEWAY_URL = os.getenv("SALAD_GATEWAY_URL", "http://localhost:8001").rstrip("/")
 SALAD_API_SECRET = os.getenv("SALAD_API_SECRET", "my-super-secret-salad-key")
+# Salad Container Gateway auth (portal → API Endpoints). Falls back to SALAD_API_SECRET if unset.
+SALAD_GATEWAY_API_KEY = (os.getenv("SALAD_GATEWAY_API_KEY") or SALAD_API_SECRET).strip()
+
+
+def salad_gateway_headers() -> dict[str, str]:
+    """Headers for requests through Salad's HTTPS gateway (auth + in-container app key)."""
+    headers = {"x-api-key": SALAD_API_SECRET}
+    if SALAD_GATEWAY_API_KEY:
+        headers["Salad-Api-Key"] = SALAD_GATEWAY_API_KEY
+    return headers
 INTERVIEW_DURATION_SEC = 1800
 VALID_SPEECH_LANGS = frozenset({"en-in", "hi", "mr", "gu"})
 
@@ -97,7 +107,7 @@ async def post_salad(path: str, payload: dict, *, alt_paths: tuple[str, ...] = (
             resp = await http_client.post(
                 url,
                 json=payload,
-                headers={"x-api-key": SALAD_API_SECRET},
+                headers=salad_gateway_headers(),
             )
         except httpx.HTTPError as exc:
             logger.error("Salad unreachable %s: %s", url, exc)
@@ -119,8 +129,18 @@ async def post_salad(path: str, payload: dict, *, alt_paths: tuple[str, ...] = (
         break
 
     detail = last_detail
-    if last_status == 401:
-        detail = "Invalid SALAD_API_SECRET (401 from GPU gateway)."
+    if last_status == 403:
+        detail = (
+            "Salad gateway rejected the request (403). Set SALAD_GATEWAY_API_KEY on EC2 to your "
+            "Salad portal API key (Container Gateway → Authentication), or disable gateway auth."
+        )
+    elif last_status == 503 or (last_detail and "503 Service Unavailable" in last_detail):
+        detail = (
+            "Salad GPU is not ready (503). Container may still be starting — check Salad Log Explorer. "
+            "Ensure the image is interview-salad-gpu:latest and readiness probe passes."
+        )
+    elif last_status == 401:
+        detail = "Invalid SALAD_API_SECRET (401 from GPU app)."
     elif last_status == 404:
         detail = (
             "GPU container is missing /chat-reply (404). "
@@ -132,8 +152,15 @@ def salad_user_error(failure: dict) -> str:
     detail = failure.get("detail", "")
     if "SALAD_GATEWAY_URL" in detail or failure.get("status_code") == 0:
         return "Cannot reach the AI GPU. On EC2, verify SALAD_GATEWAY_URL in ~/ai-voice-interview/.env points to your Salad gateway."
+    if failure.get("status_code") == 403 or "SALAD_GATEWAY_API_KEY" in detail:
+        return (
+            "Salad gateway auth failed (403). Add SALAD_GATEWAY_API_KEY to EC2 ~/ai-voice-interview/.env "
+            "(Salad portal → your container group → API Endpoints / Authentication key)."
+        )
+    if failure.get("status_code") == 503:
+        return "AI GPU is starting or unavailable (503). Wait 2–5 minutes and try again; check Salad instance logs."
     if failure.get("status_code") == 401 or "SALAD_API_SECRET" in detail:
-        return "AI GPU rejected the API key. Ensure SALAD_API_SECRET matches on EC2 and Salad Cloud."
+        return "AI GPU rejected the app API key. Ensure SALAD_API_SECRET matches on EC2 and Salad container env."
     if failure.get("status_code") == 404 or "missing /chat-reply" in detail:
         return (
             "Salad GPU is running an old image without Free Chat. "
@@ -147,7 +174,11 @@ def salad_user_error(failure: dict) -> str:
 async def startup_event():
     logger.info("Salad gateway URL: %s", SALAD_GATEWAY_URL)
     try:
-        resp = await http_client.get(f"{SALAD_GATEWAY_URL}/health", timeout=15.0)
+        resp = await http_client.get(
+            f"{SALAD_GATEWAY_URL}/health",
+            headers=salad_gateway_headers(),
+            timeout=15.0,
+        )
         if resp.status_code == 200:
             data = resp.json()
             routes = data.get("routes") or []
@@ -160,6 +191,11 @@ async def startup_event():
                 )
             else:
                 logger.info("Salad GPU api_version=%s routes=%s", data.get("api_version"), routes)
+        elif resp.status_code == 403:
+            logger.error(
+                "Salad gateway /health HTTP 403 — set SALAD_GATEWAY_API_KEY on EC2 "
+                "(Salad portal API key for Container Gateway auth)."
+            )
         else:
             logger.warning("Salad health check HTTP %s", resp.status_code)
     except httpx.HTTPError as exc:
@@ -181,7 +217,11 @@ async def diagnostics():
     salad_api_version = ""
     salad_tts_engine = ""
     try:
-        resp = await http_client.get(f"{SALAD_GATEWAY_URL}/health", timeout=10.0)
+        resp = await http_client.get(
+            f"{SALAD_GATEWAY_URL}/health",
+            headers=salad_gateway_headers(),
+            timeout=10.0,
+        )
         salad_ok = resp.status_code == 200
         salad_detail = resp.text[:300]
         if salad_ok:
@@ -204,7 +244,7 @@ async def diagnostics():
             probe_chat = await http_client.post(
                 f"{SALAD_GATEWAY_URL}/chat-reply",
                 json={"chat_text": "ping", "skip_tts": True, "speech_lang": "en-in"},
-                headers={"x-api-key": SALAD_API_SECRET},
+                headers=salad_gateway_headers(),
                 timeout=120.0,
             )
             chat_probe_ok = probe_chat.status_code == 200
@@ -222,7 +262,7 @@ async def diagnostics():
         probe = await http_client.post(
             f"{SALAD_GATEWAY_URL}/tts-only",
             json={"text": "ok"},
-            headers={"x-api-key": SALAD_API_SECRET},
+            headers=salad_gateway_headers(),
             timeout=60.0,
         )
         auth_probe_ok = probe.status_code == 200
@@ -244,6 +284,7 @@ async def diagnostics():
         "salad_chat_probe_detail": chat_probe_detail,
         "salad_auth_ok": auth_probe_ok,
         "salad_auth_detail": auth_detail,
+        "salad_gateway_key_configured": bool(SALAD_GATEWAY_API_KEY),
         "rds_writer_configured": bool(os.getenv("RDS_WRITER_URL")),
         "rds_reader_configured": bool(os.getenv("RDS_READER_URL")),
     }
@@ -263,7 +304,7 @@ async def initialize_interview(
     resp = await http_client.post(
         f"{SALAD_GATEWAY_URL}/generate-15-qa",
         json={"context": context},
-        headers={"x-api-key": SALAD_API_SECRET}
+        headers=salad_gateway_headers(),
     )
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Salad GPU Error: {resp.text}")

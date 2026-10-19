@@ -102,6 +102,7 @@ jobs:
             echo 'RDS_READER_URL=${{ secrets.RDS_READER_URL }}'        >> ~/ai-voice-interview/.env
             echo 'SALAD_GATEWAY_URL=${{ secrets.SALAD_GATEWAY_URL }}'  >> ~/ai-voice-interview/.env
             echo 'SALAD_API_SECRET=${{ secrets.SALAD_API_SECRET }}'    >> ~/ai-voice-interview/.env
+            echo 'SALAD_GATEWAY_API_KEY=${{ secrets.SALAD_GATEWAY_API_KEY }}' >> ~/ai-voice-interview/.env
             chmod 600 ~/ai-voice-interview/.env
 
             # Verify .env contents

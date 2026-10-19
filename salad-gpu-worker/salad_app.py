@@ -4,6 +4,7 @@ import json
 import re
 import uuid
 import base64
+import asyncio
 import logging
 import numpy as np
 import soundfile as sf
@@ -73,7 +74,7 @@ USE_INDIC_PARLER = os.getenv("USE_INDIC_PARLER", "1") != "0"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if USE_INDIC_PARLER:
-        indic_tts.preload_indic_tts()
+        asyncio.create_task(asyncio.to_thread(indic_tts.preload_indic_tts))
     paths = sorted({getattr(r, "path", "") for r in app.routes if getattr(r, "path", "")})
     logger.info(
         "Salad GPU ready api_version=%s chat_paths=%s all_routes=%s",

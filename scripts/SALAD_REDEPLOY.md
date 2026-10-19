@@ -18,6 +18,19 @@ Either name works on Salad: `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN`.
 
 If Parler cannot authenticate, TTS falls back to Kokoro. Set `USE_INDIC_PARLER=0` on Salad to skip Parler entirely.
 
+## Salad Container Gateway auth (403 on `/health`)
+
+If the gateway shows **Protected** / a lock icon, every request needs **two** headers (EC2 backend sends both):
+
+| Secret | Where to get it | EC2 `.env` |
+|--------|------------------|------------|
+| **Salad gateway key** | Salad portal → container group → **API Endpoints** (or Authentication) → copy API key | `SALAD_GATEWAY_API_KEY` |
+| **App key** | Same value as `SALAD_API_SECRET` on the **Salad container env** | `SALAD_API_SECRET` |
+
+If you use one shared password for both, set only `SALAD_API_SECRET` on EC2 (backend falls back for gateway auth).
+
+Salad requires **IPv6** (`::` in `start.sh`) and port **8000** matching the gateway.
+
 ---
 
 After pushing to `main`, CI publishes `DOCKERHUB_USER/interview-salad-gpu:latest`.
